@@ -1,0 +1,9 @@
+{
+  "theme": "dark",
+  "debug_port": "9421",
+  "cdp_port": "62000",
+  "debug_main": false,
+  "debug_frida": false,
+  "selected_preload_scripts": [],
+  "custom_headers": []
+}

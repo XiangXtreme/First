@@ -1,0 +1,299 @@
+syntax = "proto2";
+
+package mmbizwxadevremote;
+
+message WARemoteDebug_DataFormat {
+  optional uint32 cmd = 1;
+  optional string uuid = 2;
+  optional bytes data = 3;
+}
+
+message WARemoteDebug_BaseReq {
+  optional uint32 clientVersion = 1;
+}
+
+message WARemoteDebug_BaseResp {
+  optional int32 errcode = 1;
+  optional string errmsg = 2;
+}
+
+message WARemoteDebug_CommReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+}
+
+message WARemoteDebug_CommResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_DebugMessage {
+  optional uint32 seq = 1;
+  optional uint32 after = 2;
+  optional string category = 3;
+  optional bytes data = 4;
+  optional uint32 compressAlgo = 5;
+  optional uint32 originalSize = 6;
+}
+
+message WARemoteDebug_SendDebugMessageReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  repeated WARemoteDebug_DebugMessage debugMessageList = 2;
+  optional uint32 recvAck = 3;
+}
+
+message WARemoteDebug_SendDebugMessageResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+  optional uint32 sendAck = 2;
+}
+
+message WARemoteDebug_NewSendDebugMessageReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  repeated WARemoteDebug_DebugMessage debugMessageList = 2;
+  optional uint32 recvAck = 3;
+}
+
+message WARemoteDebug_NewSendDebugMessageResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+  optional uint32 minAck = 2;
+  optional uint32 maxAck = 3;
+}
+
+message WARemoteDebug_MessageNotify {
+  repeated WARemoteDebug_DebugMessage debugMessageList = 1;
+}
+
+message WARemoteDebug_MessageNotifyResp {
+  optional uint32 recvAck = 1;
+}
+
+message WARemoteDebug_EventNotify {
+}
+
+message WARemoteDebug_EventNotifyResp {
+}
+
+message WARemoteDebug_WxHeartBeatReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional uint32 recvAck = 2;
+}
+
+message WARemoteDebug_WxHeartBeatResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_DevHeartBeatReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional uint32 recvAck = 2;
+}
+
+message WARemoteDebug_DevHeartBeatResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_RoomInfo {
+  optional bool joinRoom = 1;
+  optional string roomId = 2;
+  optional string originalMd5 = 3;
+  optional uint32 roomStatus = 4;
+  optional uint32 wxConnStatus = 5;
+  optional uint32 devConnStatus = 6;
+}
+
+message WARemoteDebug_WxLoginReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional string loginTicket = 2;
+}
+
+message WARemoteDebug_WxLoginResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+  optional WARemoteDebug_RoomInfo roomInfo = 2;
+}
+
+message WARemoteDebug_DevLoginReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional string newticket = 2;
+  optional uint32 autodev = 3;
+}
+
+message WARemoteDebug_DevLoginResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+  optional WARemoteDebug_RoomInfo roomInfo = 2;
+}
+
+message WARemoteDebug_WxJoinRoomReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional string username = 2;
+  optional string roomId = 3;
+  optional string wxpkgInfo = 4;
+}
+
+message WARemoteDebug_WxJoinRoomResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_DevJoinRoomReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional string appid = 2;
+  optional string roomId = 3;
+  optional string wxpkgInfo = 4;
+}
+
+message WARemoteDebug_DevJoinRoomResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_WxQuitRoomReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+}
+
+message WARemoteDebug_WxQuitRoomResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_DevQuitRoomReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+}
+
+message WARemoteDebug_DevQuitRoomResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+}
+
+message WARemoteDebug_WxSyncMessageReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional uint32 minSeq = 2;
+  optional uint32 maxSeq = 3;
+}
+
+message WARemoteDebug_WxSyncMessageResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+  repeated WARemoteDebug_DebugMessage debugMessageList = 2;
+  optional uint32 sendAck = 3;
+}
+
+message WARemoteDebug_DevSyncMessageReq {
+  optional WARemoteDebug_BaseReq baseRequest = 1;
+  optional uint32 minSeq = 2;
+  optional uint32 maxSeq = 3;
+}
+
+message WARemoteDebug_DevSyncMessageResp {
+  optional WARemoteDebug_BaseResp baseResponse = 1;
+  repeated WARemoteDebug_DebugMessage debugMessageList = 2;
+  optional uint32 sendAck = 3;
+}
+
+message WARemoteDebug_MethodWithArgs {
+  optional string methodName = 1;
+  repeated string methodArgList = 2;
+}
+
+message WARemoteDebug_RegisterInterface {
+  optional string objName = 1;
+  repeated WARemoteDebug_MethodWithArgs objMethodList = 2;
+}
+
+message WARemoteDebug_DeviceInfo {
+  optional string deviceName = 1;
+  optional string deviceModel = 2;
+  optional string systemVersion = 3;
+  optional string wechatVersion = 4;
+  optional uint32 publibVersion = 5;
+  optional float screenWidth = 6;
+  optional float pixelRatio = 7;
+  optional string userAgent = 8;
+}
+
+message WARemoteDebug_SetupContext {
+  optional WARemoteDebug_RegisterInterface registerInterface = 1;
+  optional WARemoteDebug_DeviceInfo deviceInfo = 2;
+  optional string configureJs = 3;
+  optional string publicJsMd5 = 4;
+  optional string threeJsMd5 = 5;
+  optional uint32 supportCompressAlgo = 6;
+}
+
+message WARemoteDebug_CallInterface {
+  optional string objName = 1;
+  optional string methodName = 2;
+  repeated string methodArgList = 3;
+  optional uint32 callId = 4;
+}
+
+message WARemoteDebug_CallInterfaceResult {
+  optional string ret = 1;
+  optional uint32 callId = 2;
+  optional string debugInfo = 3;
+}
+
+message WARemoteDebug_EvaluateJavascript {
+  optional string script = 1;
+  optional uint32 evaluateId = 2;
+  optional string debugInfo = 3;
+}
+
+message WARemoteDebug_EvaluateJavascriptResult {
+  optional string ret = 1;
+  optional uint32 evaluateId = 2;
+}
+
+message WARemoteDebug_Breakpoint {
+  optional bool isHit = 1;
+}
+
+message WARemoteDebug_Ping {
+  optional uint64 pingId = 1;
+  optional string payload = 2;
+}
+
+message WARemoteDebug_Pong {
+  optional uint64 pingId = 1;
+  optional uint32 networkType = 2;
+  optional string payload = 3;
+}
+
+message WARemoteDebug_DomOp {
+  optional string params = 1;
+  optional uint32 webviewId = 2;
+}
+
+message WARemoteDebug_DomEvent {
+  optional string params = 1;
+  optional uint32 webviewId = 2;
+}
+
+message WARemoteDebug_NetworkDebugAPI {
+  optional string apiName = 1;
+  optional string taskId = 2;
+  optional string requestHeaders = 3;
+  optional uint64 timestamp = 4;
+}
+
+message WARemoteDebug_ChromeDevtools {
+  optional uint64 opId = 1;
+  optional string payload = 2;
+  optional string jscontextId = 3;
+}
+
+message WARemoteDebug_ChromeDevtoolsResult {
+  optional uint64 opId = 1;
+  optional string payload = 2;
+  optional string jscontextId = 3;
+}
+
+message WARemoteDebug_AddJsContext {
+  optional string jscontextId = 1;
+  optional string jscontextName = 2;
+}
+
+message WARemoteDebug_RemoveJsContext {
+  optional string jscontextId = 1;
+}
+
+message WARemoteDebug_ConnectJsContext {
+  optional string jscontextId = 1;
+}
+
+message WARemoteDebug_CustomMessage {
+  optional string method = 1;
+  optional string payload = 2;
+  optional bytes raw = 3;
+}
