@@ -50,6 +50,14 @@ pip install -r requirements.txt
 
 ---
 
+## 微信版本要求
+
+19201-11581
+作者使用版本为
+4.1.0.30
+下载地址
+- [weixin/4.1.0.30](https://github.com/vs-olitus/wx-version/releases/tag/4.1.0.30)
+- 
 ## 使用方法
 
 ### GUI 模式（推荐）
@@ -57,8 +65,12 @@ pip install -r requirements.txt
 ```bash
 python gui.py
 ```
+双击启动.bat
+启动后在主界面点击 **启动调试** 即可开始调试。
 
-启动后在主界面点击 **Start** 即可开始调试。
+### 小程序页面操作
+
+点击启动调试前请勿打开小程序, **启动调试**打开后再次启动**小程序**即可。
 
 ### CLI 模式
 
@@ -72,7 +84,6 @@ python main.py --debug-port 9421 --cdp-port 62000
 # 开启详细日志
 python main.py --debug-main --debug-frida
 ```
-
 ### 连接 Chrome DevTools
 
 启动后，在 Chrome 地址栏输入：
