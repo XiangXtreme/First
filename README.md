@@ -135,6 +135,9 @@ pyinstaller WMPFDebugger.spec
 感谢 **0xsdeo** 师傅的大力支持与思路提供。
 
 ---
+## 交流群
+
+![微信图片_20260403222425_810_3](https://s1.galgame.fun/imgb/u0/20260403_69cfdafc8cb99.jpg)
 
 ## 免责声明
 
