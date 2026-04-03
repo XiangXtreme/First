@@ -57,7 +57,7 @@ pip install -r requirements.txt
 4.1.0.30
 下载地址
 - [weixin/4.1.0.30](https://github.com/vs-olitus/wx-version/releases/tag/4.1.0.30)
-- 
+ 
 ## 使用方法
 
 ### GUI 模式（推荐）
