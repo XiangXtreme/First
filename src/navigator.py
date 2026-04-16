@@ -83,6 +83,34 @@ class MiniProgramNavigator:
         await self._ensure()
         await self.engine.evaluate_js(f"window.nav.back({delta})", timeout=5.0)
 
+    async def refresh_page(self):
+        """刷新当前小程序页面：获取当前路由后 reLaunch 到同一页面。"""
+        await self._ensure()
+        result = await self.engine.evaluate_js(
+            "(function(){"
+            "try{"
+            "var nav=window.nav;"
+            "if(!nav||!nav.wxFrame)return JSON.stringify({err:'no nav'});"
+            "var p=nav.wxFrame.getCurrentPages();"
+            "if(!p||!p.length)return JSON.stringify({err:'no page'});"
+            "var cur=p[p.length-1];"
+            "var route=cur.route||cur.__route__||'';"
+            "if(!route)return JSON.stringify({err:'no route'});"
+            "var url='/'+route;"
+            "var opts=cur.options||{};"
+            "var qs=Object.keys(opts).map(function(k){return k+'='+opts[k]}).join('&');"
+            "if(qs)url+='?'+qs;"
+            "nav.wxFrame.wx.reLaunch({url:url,"
+            "success:function(){},fail:function(e){"
+            "nav.wxFrame.wx.redirectTo({url:url,success:function(){},fail:function(){}})"
+            "}});"
+            "return JSON.stringify({ok:true,route:route})"
+            "}catch(e){return JSON.stringify({err:e.message})}"
+            "})()",
+            timeout=5.0,
+        )
+        return self._extract_value(result) or ""
+
     async def get_current_route(self):
         """Get current page route via the detected wxFrame."""
         await self._ensure()

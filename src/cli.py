@@ -7,9 +7,9 @@ CDP_PORT = 62000
 
 
 class CliOptions:
-    def __init__(self, debug_port: int, cdp_port: int, debug_main: bool, debug_frida: bool,
+    def __init__(self, cdp_port: int, debug_main: bool, debug_frida: bool,
                  scripts_dir: str = "", script_files: list = None):
-        self.debug_port = debug_port
+        self.debug_port = DEBUG_PORT  # 小程序硬编码 9421，不可修改
         self.cdp_port = cdp_port
         self.debug_main = debug_main
         self.debug_frida = debug_frida
@@ -35,18 +35,16 @@ def parse_cli_options() -> CliOptions:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""Examples:
   python main.py
-  python main.py --debug-port 9421 --cdp-port 62000
+  python main.py --cdp-port 62000
   python main.py --debug-main --debug-frida
 
 Default ports:
-  Debug server: {DEBUG_PORT}
+  Debug server: {DEBUG_PORT} (fixed)
   CDP proxy:    {CDP_PORT}
 
 Usage:
   Connect Chrome DevTools to: devtools://devtools/bundled/inspector.html?ws=127.0.0.1:<cdp-port>"""
     )
-    parser.add_argument("--debug-port", type=str, default=None,
-                        help=f"Remote debug server port (default: {DEBUG_PORT})")
     parser.add_argument("--cdp-port", type=str, default=None,
                         help=f"CDP proxy server port (default: {CDP_PORT})")
     parser.add_argument("--debug-main", action="store_true", default=False,
@@ -72,7 +70,6 @@ Usage:
             script_files.append(os.path.abspath(f))
 
     return CliOptions(
-        debug_port=parse_port("--debug-port", args.debug_port, DEBUG_PORT),
         cdp_port=parse_port("--cdp-port", args.cdp_port, CDP_PORT),
         debug_main=args.debug_main,
         debug_frida=args.debug_frida,

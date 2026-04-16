@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import queue
+import subprocess
 import sys
 import threading
 
@@ -19,10 +20,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QFrame, QPushButton, QScrollArea, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QProgressBar, QStackedWidget,
-    QMenu, QHeaderView, QAbstractItemView,
+    QMenu, QHeaderView, QAbstractItemView, QFileDialog, QInputDialog,
+    QTabWidget, QTableWidget, QTableWidgetItem, QDialog,
 )
 
-from src.cli import CliOptions, DEBUG_PORT, CDP_PORT
+from src.cli import CliOptions, CDP_PORT
 from src.logger import Logger
 from src.engine import DebugEngine
 from src.navigator import MiniProgramNavigator
@@ -56,6 +58,7 @@ _MENU = [
     ("navigator", "⬡", "路由导航"),
     ("hook",      "◈", "Hook"),
     ("cloud",     "☁", "云扫描"),
+    ("extract",   "◆", "敏感信息提取"),
     ("vconsole",  "◇", "调试开关"),
     ("logs",      "≡", "运行日志"),
 ]
@@ -232,6 +235,18 @@ def build_qss(tn):
         background: {"#1a3a2a" if tn == "dark" else "#b0dfc0"};
         color: {"#3a6a4a" if tn == "dark" else "#5a8a6a"};
     }}
+    /* 表格内按钮 — 清除全局样式，由 inline setStyleSheet 控制 */
+    QTableWidget QPushButton {{
+        background: transparent;
+        color: {c['text2']};
+        border: none;
+        border-radius: 6px;
+        padding: 4px 12px;
+        font-size: 12px;
+    }}
+    QTableWidget QPushButton:hover {{
+        background: transparent;
+    }}
 
     /* ── 输入框 ── */
     QLineEdit {{
@@ -335,6 +350,34 @@ def build_qss(tn):
     }}
     QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
         background: transparent;
+    }}
+
+    /* ── 表格控件 ── */
+    QTableWidget {{
+        background: {c['card']};
+        color: {c['text2']};
+        border: none;
+        font-size: 12px;
+        outline: 0;
+        gridline-color: {c['border']};
+    }}
+    QTableWidget::item {{
+        padding: 6px 10px;
+        border: none;
+        background: {c['card']};
+        color: {c['text2']};
+    }}
+    QTableWidget::item:selected {{
+        background: {sel_bg};
+        color: {sel_fg};
+    }}
+    QTableWidget QHeaderView::section {{
+        background: {hdr_bg};
+        color: {c['text1']};
+        border: none;
+        padding: 6px 10px;
+        font-weight: bold;
+        font-size: 12px;
     }}
 
     /* ── 滚动区域 ── */
@@ -614,6 +657,15 @@ class App(QMainWindow):
         self._sb_items = {}
         self._page_map = {}
 
+        # 敏感信息提取 状态
+        self._ext_proc = None
+        self._ext_thread = None
+        self._ext_q = queue.Queue()
+        self._ext_custom_patterns = dict(self._cfg.get("extract_custom_patterns", {}))
+        self._ext_app_states = {}   # {appid: {"decompiled": bool, "scanned": bool, ...}}
+        self._ext_app_widgets = {}  # {appid: row widget ref}
+        self._ext_current_op = None  # ("decompile"/"scan", appid) or None
+
         self._build()
         self.setStyleSheet(build_qss(self._tn))
         self._show("control")
@@ -783,6 +835,7 @@ class App(QMainWindow):
         self._build_navigator()
         self._build_hook()
         self._build_cloud()
+        self._build_extract()
         self._build_vconsole()
         self._build_logs()
 
@@ -803,12 +856,6 @@ class App(QMainWindow):
         c1_lay.addWidget(_make_label("连接设置", bold=True))
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("调试端口"))
-        self._dp_ent = _make_entry(width=100)
-        self._dp_ent.setText(str(self._cfg.get("debug_port", DEBUG_PORT)))
-        self._dp_ent.textChanged.connect(lambda: self._auto_save())
-        row1.addWidget(self._dp_ent)
-        row1.addSpacing(20)
         row1.addWidget(QLabel("CDP 端口"))
         self._cp_ent = _make_entry(width=100)
         self._cp_ent.setText(str(self._cfg.get("cdp_port", CDP_PORT)))
@@ -972,6 +1019,9 @@ class App(QMainWindow):
         self._btn_back = _make_btn("返回上页", self._do_back)
         self._btn_back.setEnabled(False)
         b1.addWidget(self._btn_back)
+        self._btn_refresh = _make_btn("刷新页面", self._do_refresh)
+        self._btn_refresh.setEnabled(False)
+        b1.addWidget(self._btn_refresh)
         b1.addStretch()
         self._btn_fetch = _make_btn("获取路由", self._do_fetch)
         self._btn_fetch.setEnabled(False)
@@ -1232,6 +1282,1219 @@ class App(QMainWindow):
 
         self._stack.addWidget(page)
         self._page_map["cloud"] = self._stack.count() - 1
+
+    # ── 敏感信息提取 ──
+
+    def _build_extract(self):
+        # 外层使用 QStackedWidget 实现子页面切换
+        self._ext_stack = QStackedWidget()
+
+        # =================== 主页面 ===================
+        main_page = QWidget()
+        main_lay = QVBoxLayout(main_page)
+        main_lay.setContentsMargins(24, 8, 24, 8)
+        main_lay.setSpacing(8)
+
+        # --- Row 1: Applet目录 ---
+        c1 = _make_card()
+        c1_lay = QVBoxLayout(c1)
+        c1_lay.setContentsMargins(16, 10, 16, 10)
+        c1_lay.setSpacing(6)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(_make_label("Applet目录", bold=True))
+        self._ext_path_ent = _make_entry("wxapkg 包目录路径...")
+        # 自动检测默认路径
+        default_pkg = ""
+        if os.name == "nt":
+            user_home = os.path.expanduser("~")
+            default_pkg = os.path.join(
+                user_home, "AppData", "Roaming", "Tencent",
+                "xwechat", "radium", "Applet", "packages"
+            )
+            if not os.path.isdir(default_pkg):
+                default_pkg = ""
+        saved_path = self._cfg.get("extract_packages_dir", "")
+        if saved_path:
+            self._ext_path_ent.setText(saved_path)
+        elif default_pkg:
+            self._ext_path_ent.setText(default_pkg)
+        # 先连接信号，然后手动刷新一次（setText 不会重复触发因为信号在之后连接）
+        # 注意: setText 在信号连接前调用，所以不会触发重复刷新
+        self._ext_path_ent.textChanged.connect(self._ext_on_path_changed)
+        path_row.addWidget(self._ext_path_ent, 1)
+        btn_auto = _make_btn("自动选择", self._ext_auto_detect)
+        path_row.addWidget(btn_auto)
+        btn_browse = _make_btn("选择", self._ext_browse)
+        path_row.addWidget(btn_browse)
+        c1_lay.addLayout(path_row)
+        main_lay.addWidget(c1)
+
+        # --- Row 2: 功能区 ---
+        func_row = QHBoxLayout()
+        self._btn_ext_regex = _make_btn("正则配置", self._ext_goto_regex)
+        func_row.addWidget(self._btn_ext_regex)
+        self._btn_ext_clear_decompiled = _make_btn("清空解包文件", self._ext_clear_decompiled)
+        func_row.addWidget(self._btn_ext_clear_decompiled)
+        self._btn_ext_clear_applet = _make_btn("清空Applet目录", self._ext_clear_applet)
+        func_row.addWidget(self._btn_ext_clear_applet)
+        func_row.addStretch()
+        # 自动反编译 & 自动提取 开关
+        func_row.addWidget(_make_label("自动反编译"))
+        self._tog_auto_dec = ToggleSwitch(self._cfg.get("auto_decompile", False))
+        self._tog_auto_dec.toggled.connect(lambda v: (self._auto_save(), self._ext_auto_process_pending() if v else None))
+        func_row.addWidget(self._tog_auto_dec)
+        func_row.addWidget(_make_label("自动提取"))
+        self._tog_auto_scan = ToggleSwitch(self._cfg.get("auto_scan", False))
+        self._tog_auto_scan.toggled.connect(lambda v: (self._auto_save(), self._ext_auto_process_pending() if v else None))
+        func_row.addWidget(self._tog_auto_scan)
+        main_lay.addLayout(func_row)
+
+        # --- 进度 + 状态 ---
+        self._ext_prog = QProgressBar()
+        self._ext_prog.setMaximum(100)
+        self._ext_prog.setValue(0)
+        self._ext_prog.setTextVisible(False)
+        self._ext_prog.setFixedHeight(6)
+        main_lay.addWidget(self._ext_prog)
+        self._ext_status_lbl = QLabel("就绪")
+        self._ext_status_lbl.setProperty("class", "muted")
+        main_lay.addWidget(self._ext_status_lbl)
+
+        # --- Row 3: 小程序列表 ---
+        list_card = _make_card()
+        list_lay = QVBoxLayout(list_card)
+        list_lay.setContentsMargins(0, 6, 0, 6)
+        list_lay.setSpacing(0)
+
+        # 表头
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(16, 4, 16, 4)
+        hdr_appid = _make_label("AppID", bold=True)
+        hdr_appid.setFixedWidth(180)
+        hdr.addWidget(hdr_appid)
+        hdr_name = _make_label("名称", bold=True)
+        hdr_name.setMinimumWidth(100)
+        hdr.addWidget(hdr_name, 1)
+        hdr_ops = _make_label("操作", bold=True)
+        hdr.addWidget(hdr_ops)
+        list_lay.addLayout(hdr)
+
+        # 分割线
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(128,128,128,0.2);")
+        list_lay.addWidget(sep)
+
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._ext_list_inner = QWidget()
+        self._ext_list_layout = QVBoxLayout(self._ext_list_inner)
+        self._ext_list_layout.setContentsMargins(8, 4, 8, 4)
+        self._ext_list_layout.setSpacing(4)
+        self._ext_list_layout.addStretch()
+        scroll.setWidget(self._ext_list_inner)
+        list_lay.addWidget(scroll, 1)
+
+        main_lay.addWidget(list_card, 1)
+
+        # 日志区
+        self._ext_logbox = QTextEdit()
+        self._ext_logbox.setReadOnly(True)
+        self._ext_logbox.setFont(QFont(_FM, 9))
+        self._ext_logbox.setMaximumHeight(120)
+        main_lay.addWidget(self._ext_logbox)
+
+        self._ext_stack.addWidget(main_page)  # index 0
+
+        # =================== 正则配置子页面 ===================
+        regex_page = QWidget()
+        regex_lay = QVBoxLayout(regex_page)
+        regex_lay.setContentsMargins(24, 8, 24, 8)
+        regex_lay.setSpacing(8)
+
+        # 返回按钮行
+        regex_top = QHBoxLayout()
+        btn_back_regex = _make_btn("← 返回", lambda: self._ext_stack.setCurrentIndex(0))
+        regex_top.addWidget(btn_back_regex)
+        regex_top.addWidget(_make_label("正则配置", bold=True))
+        regex_top.addStretch()
+        regex_lay.addLayout(regex_top)
+
+        # 自定义正则卡片
+        custom_card = _make_card()
+        cc_lay = QVBoxLayout(custom_card)
+        cc_lay.setContentsMargins(16, 10, 16, 10)
+        cc_lay.setSpacing(6)
+        cc_hdr = QHBoxLayout()
+        cc_hdr.addWidget(_make_label("自定义正则", bold=True))
+        cc_hdr.addWidget(_make_label("(提取时会与内置规则合并使用)", muted=True))
+        cc_hdr.addStretch()
+        btn_add = _make_btn("新建", self._ext_add_pattern)
+        cc_hdr.addWidget(btn_add)
+        cc_lay.addLayout(cc_hdr)
+
+        # 表头行
+        cc_hdr_row = QHBoxLayout()
+        cc_hdr_row.setContentsMargins(12, 4, 12, 4)
+        h1 = _make_label("栏目", bold=True); h1.setFixedWidth(120)
+        cc_hdr_row.addWidget(h1)
+        h2 = _make_label("正则表达式", bold=True)
+        cc_hdr_row.addWidget(h2, 1)
+        h3 = _make_label("状态", bold=True); h3.setFixedWidth(50)
+        cc_hdr_row.addWidget(h3)
+        h4 = _make_label("操作", bold=True); h4.setFixedWidth(180)
+        cc_hdr_row.addWidget(h4)
+        cc_lay.addLayout(cc_hdr_row)
+        cc_sep = QFrame(); cc_sep.setFixedHeight(1)
+        cc_sep.setStyleSheet("background: rgba(128,128,128,0.2);")
+        cc_lay.addWidget(cc_sep)
+        # 滚动区域放行列表
+        self._ext_pat_scroll = QScrollArea()
+        self._ext_pat_scroll.setWidgetResizable(True)
+        self._ext_pat_scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._ext_pat_inner = QWidget()
+        self._ext_pat_layout = QVBoxLayout(self._ext_pat_inner)
+        self._ext_pat_layout.setContentsMargins(0, 0, 0, 0)
+        self._ext_pat_layout.setSpacing(4)
+        self._ext_pat_layout.addStretch()
+        self._ext_pat_scroll.setWidget(self._ext_pat_inner)
+        cc_lay.addWidget(self._ext_pat_scroll)
+        regex_lay.addWidget(custom_card, 1)  # stretch=1，自定义区域占大空间
+
+        # 内置正则卡片（紧凑）
+        builtin_card = _make_card()
+        bc_lay = QVBoxLayout(builtin_card)
+        bc_lay.setContentsMargins(16, 10, 16, 10)
+        bc_lay.setSpacing(6)
+        bc_lay.addWidget(_make_label("内置正则规则 (只读)", bold=True))
+
+        self._ext_builtin_tree = QTreeWidget()
+        self._ext_builtin_tree.setHeaderLabels(["分类", "正则/说明"])
+        bh = self._ext_builtin_tree.header()
+        bh.setStretchLastSection(True)
+        bh.setSectionResizeMode(0, QHeaderView.Interactive)
+        self._ext_builtin_tree.setColumnWidth(0, 200)
+        self._ext_builtin_tree.setRootIsDecorated(False)
+        self._ext_builtin_tree.setMaximumHeight(200)
+        bc_lay.addWidget(self._ext_builtin_tree)
+        regex_lay.addWidget(builtin_card)  # 无stretch，内置区域紧凑
+
+        self._ext_stack.addWidget(regex_page)  # index 1
+
+        # =================== 查看敏感信息子页面 ===================
+        view_page = QWidget()
+        view_lay = QVBoxLayout(view_page)
+        view_lay.setContentsMargins(16, 8, 16, 8)
+        view_lay.setSpacing(6)
+
+        view_top = QHBoxLayout()
+        btn_back_view = _make_btn("← 返回", lambda: self._ext_stack.setCurrentIndex(0))
+        view_top.addWidget(btn_back_view)
+        self._ext_view_title = _make_label("查看敏感信息", bold=True)
+        view_top.addWidget(self._ext_view_title)
+        view_top.addStretch()
+        self._btn_ext_open_html = _make_btn("网页访问", self._ext_open_html)
+        view_top.addWidget(self._btn_ext_open_html)
+        view_lay.addLayout(view_top)
+
+        # 结果展示区 (滚动)
+        self._ext_view_scroll = QScrollArea()
+        self._ext_view_scroll.setWidgetResizable(True)
+        self._ext_view_scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._ext_view_inner = QWidget()
+        self._ext_view_top_layout = QVBoxLayout(self._ext_view_inner)
+        self._ext_view_top_layout.setContentsMargins(0, 0, 0, 0)
+        self._ext_view_top_layout.setSpacing(0)
+        self._ext_view_scroll.setWidget(self._ext_view_inner)
+        view_lay.addWidget(self._ext_view_scroll, 1)
+
+        self._ext_stack.addWidget(view_page)  # index 2
+
+        # 注册到主 stack
+        self._stack.addWidget(self._ext_stack)
+        self._page_map["extract"] = self._stack.count() - 1
+
+        # 填充内置正则
+        self._ext_fill_builtin_patterns()
+        self._ext_refresh_custom_patterns()
+
+        # 延迟加载小程序列表
+        QTimer.singleShot(500, self._ext_refresh_apps)
+
+        # 定时监控目录变化 (每5秒)
+        self._ext_watch_timer = QTimer()
+        self._ext_watch_timer.timeout.connect(self._ext_check_dir_changes)
+        self._ext_watch_timer.start(5000)
+        self._ext_last_appids = set()  # 上一次扫描到的 appids
+
+        # 存储当前查看的 html path
+        self._ext_current_html = ""
+        self._ext_current_json = ""
+
+    # ============================================
+    # 提取页 - 辅助方法
+    # ============================================
+
+    def _ext_browse(self):
+        d = QFileDialog.getExistingDirectory(self, "选择小程序包目录", self._ext_path_ent.text())
+        if d:
+            self._ext_path_ent.setText(d)
+
+    def _ext_on_path_changed(self):
+        """路径变化时自动保存和刷新列表"""
+        self._auto_save()
+        self._ext_refresh_apps()
+
+    def _ext_check_dir_changes(self):
+        """定时检查目录是否有新的小程序包"""
+        pkg_dir = self._ext_path_ent.text().strip()
+        if not pkg_dir or not os.path.isdir(pkg_dir):
+            return
+
+        # 快速扫描子目录名称
+        try:
+            current_dirs = set()
+            for entry in os.listdir(pkg_dir):
+                if os.path.isdir(os.path.join(pkg_dir, entry)):
+                    current_dirs.add(entry)
+        except Exception:
+            return
+
+        if current_dirs != self._ext_last_appids:
+            new_ids = current_dirs - self._ext_last_appids
+            self._ext_last_appids = current_dirs
+            if new_ids:
+                self._ext_refresh_apps()
+                for nid in new_ids:
+                    self._ext_log(f"检测到新小程序: {nid}")
+                # 自动处理新增的小程序
+                self._ext_auto_process_new(new_ids)
+
+    def _ext_auto_detect(self):
+        """自动检测默认路径"""
+        if os.name == "nt":
+            user_home = os.path.expanduser("~")
+            default_pkg = os.path.join(
+                user_home, "AppData", "Roaming", "Tencent",
+                "xwechat", "radium", "Applet", "packages"
+            )
+            if os.path.isdir(default_pkg):
+                if self._ext_path_ent.text().strip() == default_pkg:
+                    # 路径相同但强制刷新
+                    self._ext_refresh_apps()
+                else:
+                    self._ext_path_ent.setText(default_pkg)
+                self._ext_log("已自动检测到 Applet 目录")
+            else:
+                self._ext_log("未找到默认 Applet 目录，请手动选择")
+        else:
+            self._ext_log("非 Windows 系统，请手动选择目录")
+
+    def _ext_auto_process_new(self, new_ids):
+        """对新增的小程序自动执行反编译/扫描（按开关状态）"""
+        if not self._tog_auto_dec.isChecked() and not self._tog_auto_scan.isChecked():
+            return
+        # 如果当前已有任务在运行，排队延迟处理
+        if self._ext_current_op is not None:
+            QTimer.singleShot(3000, lambda ids=set(new_ids): self._ext_auto_process_new(ids))
+            return
+        for appid in sorted(new_ids):
+            state = self._ext_app_states.get(appid, {})
+            if self._tog_auto_dec.isChecked() and not state.get("decompiled", False):
+                self._ext_log(f"[自动] 开始反编译: {appid}")
+                self._ext_do_decompile(appid)
+                return  # 一次处理一个，完成后 _handle_ext 会触发下一步
+            if self._tog_auto_scan.isChecked() and state.get("decompiled", False) and not state.get("scanned", False):
+                self._ext_log(f"[自动] 开始提取: {appid}")
+                self._ext_do_scan(appid)
+                return
+
+    def _ext_auto_process_pending(self):
+        """遍历所有已知app，对未处理的自动执行反编译/扫描"""
+        if self._ext_current_op is not None:
+            return
+        for appid, state in self._ext_app_states.items():
+            if self._tog_auto_dec.isChecked() and not state.get("decompiled", False):
+                self._ext_log(f"[自动] 开始反编译: {appid}")
+                self._ext_do_decompile(appid)
+                return
+            if self._tog_auto_scan.isChecked() and state.get("decompiled", False) and not state.get("scanned", False):
+                self._ext_log(f"[自动] 开始提取: {appid}")
+                self._ext_do_scan(appid)
+                return
+
+    def _ext_log(self, msg):
+        c = _TH[self._tn]
+        self._ext_logbox.append(f'<span style="color:{c["text2"]}">{msg}</span>')
+        sb = self._ext_logbox.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _ext_get_app_name(self, appid, pkgs, output_base):
+        """尝试从已解包文件中读取小程序名称"""
+        app_output = os.path.join(output_base, appid)
+        decompile_dir = os.path.join(app_output, "decompiled")
+
+        # 尝试从 app-config.json 读取
+        for fname in ("app-config.json", "app.json"):
+            cfg_path = os.path.join(decompile_dir, fname)
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    # 多种可能的字段
+                    name = (cfg.get("window", {}).get("navigationBarTitleText", "")
+                            or cfg.get("appname", "")
+                            or cfg.get("entryPagePath", ""))
+                    if name:
+                        return f"{name}  ({len(pkgs)}pkg)"
+                except Exception:
+                    pass
+
+        return f"{len(pkgs)} pkg"
+
+    def _ext_refresh_apps(self):
+        """刷新小程序列表"""
+        pkg_dir = self._ext_path_ent.text().strip()
+        if not pkg_dir or not os.path.isdir(pkg_dir):
+            return
+
+        # 清除旧列表
+        while self._ext_list_layout.count() > 1:  # 保留 stretch
+            item = self._ext_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._ext_app_widgets.clear()
+
+        # 扫描目录
+        try:
+            from src.wxapkg import find_wxapkg_files
+            all_pkgs = find_wxapkg_files(pkg_dir)
+        except Exception as e:
+            self._ext_log(f"扫描目录失败: {e}")
+            return
+
+        # 按 appid 分组
+        appid_groups = {}
+        for pkg in all_pkgs:
+            appid_groups.setdefault(pkg["appid"], []).append(pkg)
+
+        if not appid_groups:
+            self._ext_status_lbl.setText("未找到小程序")
+            return
+
+        c = _TH[self._tn]
+        output_base = os.path.join(_BASE_DIR, "output")
+
+        for appid, pkgs in sorted(appid_groups.items()):
+            row = QFrame()
+            row.setStyleSheet(
+                f"QFrame {{ background: {c['input']}; border-radius: 8px; }}"
+                f"QFrame QLabel {{ background: transparent; }}")
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(12, 6, 12, 6)
+            row_lay.setSpacing(6)
+
+            lbl_id = QLabel(appid)
+            lbl_id.setFixedWidth(180)
+            lbl_id.setFont(QFont(_FM, 9))
+            lbl_id.setStyleSheet(f"color: {c['text1']};")
+            row_lay.addWidget(lbl_id)
+
+            # 检查是否已解包
+            app_output = os.path.join(output_base, appid)
+            decompile_dir = os.path.join(app_output, "decompiled")
+            result_dir = os.path.join(app_output, "result")
+            is_decompiled = os.path.isdir(decompile_dir) and any(
+                f.endswith(('.js', '.html', '.htm'))
+                for _, _, files in os.walk(decompile_dir) for f in files
+            ) if os.path.isdir(decompile_dir) else False
+            is_scanned = os.path.isfile(os.path.join(result_dir, "report.json"))
+
+            # 尝试读取小程序名称
+            app_name = self._ext_get_app_name(appid, pkgs, output_base) if is_decompiled else f"{len(pkgs)} pkg (未反编译)"
+            lbl_name = QLabel(app_name)
+            lbl_name.setMinimumWidth(100)
+            lbl_name.setFont(QFont(_FN, 9))
+            lbl_name.setStyleSheet(f"color: {c['text2']};")
+            row_lay.addWidget(lbl_name, 1)
+
+            self._ext_app_states[appid] = {
+                "decompiled": is_decompiled,
+                "scanned": is_scanned,
+                "packages": pkgs,
+                "decompile_dir": decompile_dir,
+                "result_dir": result_dir,
+            }
+
+            # 按钮
+            btn_dec = QPushButton("反编译")
+            btn_dec.setFixedWidth(60)
+            btn_dec.clicked.connect(lambda _, a=appid: self._ext_do_decompile(a))
+            if is_decompiled:
+                btn_dec.setStyleSheet(
+                    f"QPushButton {{ background: {c['success']}; color: #111; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}")
+            row_lay.addWidget(btn_dec)
+
+            btn_scan = QPushButton("提取")
+            btn_scan.setFixedWidth(50)
+            btn_scan.setEnabled(is_decompiled)
+            btn_scan.clicked.connect(lambda _, a=appid: self._ext_do_scan(a))
+            row_lay.addWidget(btn_scan)
+
+            btn_view = QPushButton("查看")
+            btn_view.setFixedWidth(50)
+            btn_view.setEnabled(is_scanned)
+            btn_view.clicked.connect(lambda _, a=appid: self._ext_view_results(a))
+            row_lay.addWidget(btn_view)
+
+            btn_del = QPushButton("删除")
+            btn_del.setFixedWidth(50)
+            btn_del.clicked.connect(lambda _, a=appid: self._ext_delete_app(a))
+            btn_del.setStyleSheet(
+                f"QPushButton {{ background: {c['error']}; color: #fff; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}"
+                f"QPushButton:hover {{ background: #dc2626; }}")
+            row_lay.addWidget(btn_del)
+
+            self._ext_app_widgets[appid] = {
+                "row": row, "btn_dec": btn_dec, "btn_scan": btn_scan,
+                "btn_view": btn_view, "btn_del": btn_del, "lbl_name": lbl_name,
+            }
+
+            # 插入在 stretch 之前
+            self._ext_list_layout.insertWidget(self._ext_list_layout.count() - 1, row)
+
+        self._ext_status_lbl.setText(f"发现 {len(appid_groups)} 个小程序")
+        # 记录当前已知 appid 集合 (供目录监控用)
+        self._ext_last_appids = set(appid_groups.keys())
+
+    def _ext_update_app_buttons(self, appid):
+        """更新指定 app 的按钮状态"""
+        state = self._ext_app_states.get(appid, {})
+        widgets = self._ext_app_widgets.get(appid, {})
+        if not widgets:
+            return
+        c = _TH[self._tn]
+        is_dec = state.get("decompiled", False)
+        is_scanned = state.get("scanned", False)
+
+        btn_dec = widgets["btn_dec"]
+        if is_dec:
+            btn_dec.setStyleSheet(
+                f"QPushButton {{ background: {c['success']}; color: #111; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}")
+        else:
+            btn_dec.setStyleSheet("")
+
+        widgets["btn_scan"].setEnabled(is_dec)
+        widgets["btn_view"].setEnabled(is_scanned)
+
+    # ============================================
+    # 提取页 - 反编译
+    # ============================================
+
+    def _ext_do_decompile(self, appid):
+        if self._ext_proc:
+            self._ext_log("有任务正在运行，请等待完成")
+            return
+
+        output_base = os.path.join(_BASE_DIR, "output")
+        app_output = os.path.join(output_base, appid)
+        os.makedirs(app_output, exist_ok=True)
+
+        pkg_dir = self._ext_path_ent.text().strip()
+        worker_path = os.path.join(_BASE_DIR, "src", "extract_worker.py")
+        cmd = [
+            sys.executable, worker_path, "decompile",
+            "--packages-dir", pkg_dir,
+            "--appid", appid,
+            "--output-dir", app_output,
+        ]
+
+        self._ext_log(f"开始反编译: {appid}")
+        self._ext_prog.setValue(0)
+        self._ext_status_lbl.setText(f"正在反编译 {appid}...")
+        self._ext_current_op = ("decompile", appid)
+
+        try:
+            self._ext_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception as e:
+            self._ext_log(f"启动失败: {e}")
+            return
+
+        self._ext_thread = threading.Thread(target=self._ext_reader, daemon=True)
+        self._ext_thread.start()
+
+    # ============================================
+    # 提取页 - 敏感信息扫描
+    # ============================================
+
+    def _ext_do_scan(self, appid):
+        if self._ext_proc:
+            self._ext_log("有任务正在运行，请等待完成")
+            return
+
+        state = self._ext_app_states.get(appid, {})
+        if not state.get("decompiled"):
+            self._ext_log(f"请先反编译 {appid}")
+            return
+
+        output_base = os.path.join(_BASE_DIR, "output")
+        app_output = os.path.join(output_base, appid)
+        decompile_dir = state.get("decompile_dir", os.path.join(app_output, "decompiled"))
+        result_dir = os.path.join(app_output, "result")
+        os.makedirs(result_dir, exist_ok=True)
+
+        # 保存自定义正则
+        custom_file = ""
+        if self._ext_custom_patterns:
+            custom_file = os.path.join(_BASE_DIR, ".extract_custom_patterns.json")
+            with open(custom_file, "w", encoding="utf-8") as f:
+                json.dump(self._ext_custom_patterns, f, ensure_ascii=False)
+
+        worker_path = os.path.join(_BASE_DIR, "src", "extract_worker.py")
+        cmd = [
+            sys.executable, worker_path, "scan",
+            "--scan-dir", decompile_dir,
+            "--output-dir", result_dir,
+        ]
+        if custom_file:
+            cmd += ["--custom-patterns", custom_file]
+
+        self._ext_log(f"开始提取敏感信息: {appid}")
+        self._ext_prog.setValue(0)
+        self._ext_status_lbl.setText(f"正在扫描 {appid}...")
+        self._ext_current_op = ("scan", appid)
+
+        try:
+            self._ext_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception as e:
+            self._ext_log(f"启动失败: {e}")
+            return
+
+        self._ext_thread = threading.Thread(target=self._ext_reader, daemon=True)
+        self._ext_thread.start()
+
+    # ============================================
+    # 提取页 - 子进程通信
+    # ============================================
+
+    def _ext_reader(self):
+        """后台线程读取子进程 stdout"""
+        proc = self._ext_proc
+        if not proc or not proc.stdout:
+            return
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    self._ext_q.put(obj)
+                except json.JSONDecodeError:
+                    self._ext_q.put({"type": "log", "msg": line})
+        except Exception:
+            pass
+        finally:
+            proc.wait()
+            stderr_out = ""
+            if proc.stderr:
+                try:
+                    stderr_out = proc.stderr.read()
+                except Exception:
+                    pass
+            if stderr_out:
+                self._ext_q.put({"type": "log", "msg": f"[stderr] {stderr_out[:500]}"})
+            self._ext_q.put({"type": "__done__", "returncode": proc.returncode})
+
+    # ============================================
+    # 提取页 - 查看结果
+    # ============================================
+
+    def _ext_view_results(self, appid):
+        """查看敏感信息子页面 — 双列布局，仿 HTML 报告样式"""
+        state = self._ext_app_states.get(appid, {})
+        result_dir = state.get("result_dir", "")
+        json_path = os.path.join(result_dir, "report.json")
+        html_path = os.path.join(result_dir, "report.html")
+
+        if not os.path.isfile(json_path):
+            self._ext_log(f"未找到 {appid} 的扫描结果")
+            return
+
+        self._ext_current_html = html_path
+        self._ext_current_json = json_path
+        self._ext_view_title.setText(f"查看敏感信息 - {appid}")
+
+        # 清除旧内容
+        layout = self._ext_view_top_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout():
+                # 递归删除子布局
+                sub = item.layout()
+                while sub.count():
+                    si = sub.takeAt(0)
+                    sw = si.widget()
+                    if sw:
+                        sw.deleteLater()
+
+        # 加载 JSON 数据
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self._ext_log(f"加载结果失败: {e}")
+            return
+
+        c = _TH[self._tn]
+        accent = c["accent"]  # 绿色
+
+        cat_labels = {
+            'ip': 'IP', 'ip_port': 'IP:PORT', 'domain': '域名',
+            'sfz': '身份证', 'mobile': '手机号', 'mail': '邮箱',
+            'jwt': 'JWT', 'algorithm': '加密算法', 'secret': 'Secret/密钥',
+            'path': 'Path', 'incomplete_path': 'IncompletePath',
+            'url': 'URL', 'static': 'StaticUrl'
+        }
+        # 反向映射: 中文标签 → 内置key
+        label_to_key = {v: k for k, v in cat_labels.items()}
+
+        left_cats = ['ip', 'ip_port', 'domain', 'sfz', 'mobile', 'mail', 'jwt', 'algorithm', 'secret']
+        right_cats = ['path', 'incomplete_path', 'url', 'static']
+        all_builtin = set(left_cats + right_cats)
+
+        # 合并自定义结果到同名内置分类，去重
+        merged_data = {}
+        custom_only_keys = []
+        for k, v in data.items():
+            if k == "_meta":
+                continue
+            items = v if isinstance(v, list) else []
+            if k in all_builtin:
+                merged_data.setdefault(k, []).extend(items)
+            elif k in label_to_key:
+                # 自定义名称和内置中文标签相同，合并到内置分类
+                builtin_key = label_to_key[k]
+                merged_data.setdefault(builtin_key, []).extend(items)
+            else:
+                merged_data.setdefault(k, []).extend(items)
+                if k not in all_builtin:
+                    custom_only_keys.append(k)
+
+        # 去重
+        for k in merged_data:
+            seen = set()
+            deduped = []
+            for item in merged_data[k]:
+                s = str(item)
+                if s not in seen:
+                    seen.add(s)
+                    deduped.append(item)
+            merged_data[k] = deduped
+
+        def _build_cat_widget(key, label, items):
+            """构建单个分类的 widget — 支持展开/折叠"""
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            lay.setContentsMargins(0, 8, 0, 4)
+            lay.setSpacing(2)
+
+            # 标题行: ▶ 分类名 (数量)   [复制]
+            title_row = QHBoxLayout()
+            title_row.setContentsMargins(0, 0, 0, 0)
+
+            # 展开/折叠按钮
+            btn_fold = QPushButton("▼")
+            btn_fold.setFixedSize(20, 20)
+            btn_fold.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_fold.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {c['text3']}; border: none;"
+                f"font-size: 10px; padding: 0; }}"
+                f"QPushButton:hover {{ color: {c['text1']}; }}")
+            title_row.addWidget(btn_fold)
+
+            title_lbl = QLabel(f"{label} ({len(items)})")
+            title_lbl.setFont(QFont(_FN, 11, QFont.Weight.Bold))
+            title_lbl.setStyleSheet(
+                f"color: {c['text1']}; border-left: 4px solid {accent}; padding-left: 8px;"
+                f"background: transparent;")
+            title_row.addWidget(title_lbl)
+            title_row.addStretch()
+
+            btn_copy = QPushButton("复制")
+            btn_copy.setFixedSize(48, 26)
+            btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_copy.setStyleSheet(
+                f"QPushButton {{ background: {c['input']}; color: {accent}; border: 1px solid {accent};"
+                f"border-radius: 4px; font-size: 11px; padding: 2px 8px; }}"
+                f"QPushButton:hover {{ background: {accent}; color: #111; }}")
+            copy_text = "\n".join(str(i) for i in items)
+            btn_copy.clicked.connect(lambda _, t=copy_text, b=btn_copy: self._ext_copy_cat(t, b))
+            title_row.addWidget(btn_copy)
+            lay.addLayout(title_row)
+
+            # 内容区域（可折叠）
+            content_widget = QWidget()
+            content_lay = QVBoxLayout(content_widget)
+            content_lay.setContentsMargins(0, 0, 0, 0)
+            content_lay.setSpacing(0)
+            if items:
+                content_lbl = QLabel()
+                content_lbl.setFont(QFont(_FM, 9))
+                content_lbl.setWordWrap(True)
+                content_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                content_lbl.setStyleSheet(
+                    f"color: {c['text2']}; padding-left: 14px; background: transparent;")
+                display_items = items[:200]
+                lines = [str(i) for i in display_items]
+                if len(items) > 200:
+                    lines.append(f"... 共 {len(items)} 条，仅显示前 200 条")
+                content_lbl.setText("\n".join(lines))
+                content_lay.addWidget(content_lbl)
+            lay.addWidget(content_widget)
+
+            # 展开/折叠逻辑 — 默认展开
+            def toggle_fold():
+                visible = content_widget.isVisible()
+                content_widget.setVisible(not visible)
+                btn_fold.setText("▶" if visible else "▼")
+
+            btn_fold.clicked.connect(toggle_fold)
+
+            return w
+
+        # === 双列布局 ===
+        cols_widget = QWidget()
+        cols_layout = QHBoxLayout(cols_widget)
+        cols_layout.setContentsMargins(0, 0, 0, 0)
+        cols_layout.setSpacing(16)
+
+        # 左列
+        left_col = QWidget()
+        left_lay = QVBoxLayout(left_col)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(0)
+        for cat in left_cats:
+            label = cat_labels.get(cat, cat)
+            items = merged_data.get(cat, [])
+            left_lay.addWidget(_build_cat_widget(cat, label, items))
+        # 自定义规则(非同名)放左列底部
+        for key in custom_only_keys:
+            items = merged_data.get(key, [])
+            left_lay.addWidget(_build_cat_widget(key, key, items))
+        left_lay.addStretch()
+        cols_layout.addWidget(left_col, 1)
+
+        # 分隔线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color: rgba(128,128,128,0.2);")
+        cols_layout.addWidget(sep)
+
+        # 右列
+        right_col = QWidget()
+        right_lay = QVBoxLayout(right_col)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(0)
+        for cat in right_cats:
+            label = cat_labels.get(cat, cat)
+            items = merged_data.get(cat, [])
+            right_lay.addWidget(_build_cat_widget(cat, label, items))
+        right_lay.addStretch()
+        cols_layout.addWidget(right_col, 1)
+
+        layout.addWidget(cols_widget)
+        layout.addStretch()
+
+        # 切换到查看页
+        self._ext_stack.setCurrentIndex(2)
+
+    def _ext_copy_cat(self, text, btn):
+        """复制分类内容并显示反馈"""
+        QApplication.clipboard().setText(text)
+        old = btn.text()
+        btn.setText("✓")
+        QTimer.singleShot(1200, lambda: btn.setText(old))
+
+    def _ext_open_html(self):
+        """浏览器打开 HTML 报告"""
+        if self._ext_current_html and os.path.isfile(self._ext_current_html):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._ext_current_html))
+        else:
+            self._ext_log("HTML 报告不存在")
+
+    # ============================================
+    # 提取页 - 删除
+    # ============================================
+
+    def _ext_delete_app(self, appid):
+        """删除指定小程序的解包和结果"""
+        import shutil
+        output_base = os.path.join(_BASE_DIR, "output")
+        app_output = os.path.join(output_base, appid)
+        if os.path.isdir(app_output):
+            try:
+                shutil.rmtree(app_output)
+                self._ext_log(f"已删除 {appid} 的数据")
+            except Exception as e:
+                self._ext_log(f"删除失败: {e}")
+
+        # 更新状态
+        if appid in self._ext_app_states:
+            self._ext_app_states[appid]["decompiled"] = False
+            self._ext_app_states[appid]["scanned"] = False
+        self._ext_update_app_buttons(appid)
+        # 如果开启了自动反编译，重新处理
+        QTimer.singleShot(500, self._ext_auto_process_pending)
+
+    def _ext_clear_decompiled(self):
+        """清空所有解包文件"""
+        import shutil
+        output_base = os.path.join(_BASE_DIR, "output")
+        if not os.path.isdir(output_base):
+            return
+        count = 0
+        for appid in os.listdir(output_base):
+            dec_dir = os.path.join(output_base, appid, "decompiled")
+            if os.path.isdir(dec_dir):
+                try:
+                    shutil.rmtree(dec_dir)
+                    count += 1
+                except Exception:
+                    pass
+        self._ext_log(f"已清空 {count} 个小程序的解包文件")
+        # 刷新状态
+        for appid in self._ext_app_states:
+            self._ext_app_states[appid]["decompiled"] = False
+            self._ext_app_states[appid]["scanned"] = False
+            self._ext_update_app_buttons(appid)
+        # 如果开启了自动反编译，重新处理
+        QTimer.singleShot(500, self._ext_auto_process_pending)
+
+    def _ext_clear_applet(self):
+        """清空 Applet 目录"""
+        import shutil
+        pkg_dir = self._ext_path_ent.text().strip()
+        if not pkg_dir or not os.path.isdir(pkg_dir):
+            self._ext_log("Applet 目录不存在")
+            return
+        try:
+            for entry in os.listdir(pkg_dir):
+                full = os.path.join(pkg_dir, entry)
+                if os.path.isdir(full):
+                    shutil.rmtree(full)
+            self._ext_log("已清空 Applet 目录")
+            self._ext_refresh_apps()
+        except Exception as e:
+            self._ext_log(f"清空失败: {e}")
+
+    # ============================================
+    # 提取页 - 正则管理
+    # ============================================
+
+    def _ext_goto_regex(self):
+        self._ext_stack.setCurrentIndex(1)
+
+    def _ext_fill_builtin_patterns(self):
+        """填充内置正则到树"""
+        from src.extractor import Extractor
+        builtin = Extractor.get_all_builtin_patterns()
+        self._ext_builtin_tree.clear()
+        for name, pat in builtin.items():
+            display = pat if len(pat) < 200 else pat[:200] + "..."
+            item = QTreeWidgetItem([name, display])
+            self._ext_builtin_tree.addTopLevelItem(item)
+
+    def _ext_refresh_custom_patterns(self):
+        """刷新自定义正则行列表 — 用 QFrame 行代替 QTableWidget"""
+        lay = self._ext_pat_layout
+        # 清除旧行(保留最后一个 stretch)
+        while lay.count() > 1:
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        c = _TH[self._tn]
+        for name, info in self._ext_custom_patterns.items():
+            if isinstance(info, str):
+                pat = info; enabled = True
+            else:
+                pat = info.get("regex", ""); enabled = info.get("enabled", True)
+            row = QFrame()
+            row.setObjectName("_ext_pat_row")
+            row.setStyleSheet(
+                f"QFrame#_ext_pat_row {{ background: {c['input']}; border-radius: 8px; }}"
+                f"QFrame#_ext_pat_row QLabel {{ background: transparent; border: none; }}")
+            row.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            row.customContextMenuRequested.connect(lambda pos, n=name: self._ext_pattern_ctx(pos, n))
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(12, 6, 12, 6)
+            rl.setSpacing(6)
+            lbl_n = QLabel(name)
+            lbl_n.setFixedWidth(120)
+            lbl_n.setFont(QFont(_FM, 9))
+            lbl_n.setStyleSheet(f"color: {c['text1']};")
+            rl.addWidget(lbl_n)
+            lbl_p = QLabel(pat if len(pat) < 80 else pat[:80] + "...")
+            lbl_p.setFont(QFont(_FM, 9))
+            lbl_p.setStyleSheet(f"color: {c['text2']};")
+            lbl_p.setToolTip(pat)
+            rl.addWidget(lbl_p, 1)
+            lbl_s = QLabel("启用" if enabled else "禁用")
+            lbl_s.setFixedWidth(50)
+            lbl_s.setStyleSheet(f"color: {c['success'] if enabled else c['error']};")
+            rl.addWidget(lbl_s)
+            btn_edit = QPushButton("修改")
+            btn_edit.setFixedWidth(50)
+            btn_edit.clicked.connect(lambda _, n=name: self._ext_edit_pattern(n))
+            rl.addWidget(btn_edit)
+            btn_toggle = QPushButton("禁用" if enabled else "启用")
+            btn_toggle.setFixedWidth(50)
+            if enabled:
+                btn_toggle.setStyleSheet(
+                    f"QPushButton {{ background: {c['warning']}; color: #111; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}"
+                    f"QPushButton:hover {{ background: #ca8a04; }}")
+            else:
+                btn_toggle.setStyleSheet(
+                    f"QPushButton {{ background: {c['success']}; color: #111; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}")
+            btn_toggle.clicked.connect(lambda _, n=name: self._ext_toggle_pattern(n))
+            rl.addWidget(btn_toggle)
+            btn_del = QPushButton("删除")
+            btn_del.setFixedWidth(50)
+            btn_del.setStyleSheet(
+                f"QPushButton {{ background: {c['error']}; color: #fff; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}"
+                f"QPushButton:hover {{ background: #dc2626; }}")
+            btn_del.clicked.connect(lambda _, n=name: self._ext_delete_pattern(n))
+            rl.addWidget(btn_del)
+            lay.insertWidget(lay.count() - 1, row)
+
+    def _ext_add_pattern(self):
+        """新建空白行 — 用 QLineEdit 输入"""
+        c = _TH[self._tn]
+        row = QFrame()
+        row.setObjectName("_ext_new_row")
+        row.setStyleSheet(
+            f"QFrame#_ext_new_row {{ background: {c['input']}; border-radius: 8px; border: 1px solid {c['accent']}; }}"
+            f"QFrame#_ext_new_row QLabel {{ background: transparent; border: none; }}"
+            f"QFrame#_ext_new_row QLineEdit {{ border: 1px solid {c['border']}; border-radius: 4px; padding: 4px 6px; background: {c['card']}; color: {c['text1']}; }}")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(12, 6, 12, 6)
+        rl.setSpacing(6)
+        ent_name = QLineEdit()
+        ent_name.setPlaceholderText("栏目名...")
+        ent_name.setFixedWidth(120)
+        rl.addWidget(ent_name)
+        ent_regex = QLineEdit()
+        ent_regex.setPlaceholderText("正则表达式...")
+        rl.addWidget(ent_regex, 1)
+        lbl_s = QLabel("启用")
+        lbl_s.setFixedWidth(50)
+        rl.addWidget(lbl_s)
+        btn_ok = QPushButton("确认")
+        btn_ok.setFixedWidth(50)
+        btn_ok.clicked.connect(lambda: self._ext_confirm_new(ent_name, ent_regex, row))
+        rl.addWidget(btn_ok)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedWidth(50)
+        btn_cancel.setStyleSheet(
+            f"QPushButton {{ background: {c['error']}; color: #fff; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}"
+            f"QPushButton:hover {{ background: #dc2626; }}")
+        btn_cancel.clicked.connect(lambda: (row.deleteLater(),))
+        rl.addWidget(btn_cancel)
+        self._ext_pat_layout.insertWidget(self._ext_pat_layout.count() - 1, row)
+        ent_name.setFocus()
+
+    def _ext_confirm_new(self, ent_name, ent_regex, row_widget):
+        """确认新建正则"""
+        name = ent_name.text().strip()
+        regex = ent_regex.text().strip()
+        if not name or not regex:
+            self._ext_log("栏目名和正则不能为空")
+            return
+        import re as _re
+        try:
+            _re.compile(regex)
+        except _re.error as e:
+            self._ext_log(f"正则语法错误: {e}")
+            return
+        self._ext_custom_patterns[name] = {"regex": regex, "enabled": True}
+        row_widget.deleteLater()
+        self._ext_refresh_custom_patterns()
+        self._auto_save()
+        self._ext_log(f"已添加规则: {name}")
+
+    def _ext_pattern_ctx(self, pos, name):
+        """右键菜单"""
+        info = self._ext_custom_patterns.get(name, "")
+        regex = info.get("regex", info) if isinstance(info, dict) else info
+        menu = QMenu(self)
+        menu.addAction("测试正则", lambda: self._ext_test_pattern(name))
+        menu.addAction("复制正则", lambda: QApplication.clipboard().setText(regex))
+        # 找到发送信号的 widget
+        sender = self.sender()
+        if sender:
+            menu.exec(sender.mapToGlobal(pos))
+        else:
+            menu.exec(self.cursor().pos())
+
+    def _ext_test_pattern(self, name):
+        """弹窗测试正则"""
+        info = self._ext_custom_patterns.get(name, "")
+        regex = info.get("regex", info) if isinstance(info, dict) else info
+        import re as _re
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"测试正则 - {name}")
+        dlg.resize(600, 400)
+        lay = QVBoxLayout(dlg)
+
+        lay.addWidget(QLabel(f"正则: {regex}"))
+
+        input_lbl = QLabel("输入测试文本:")
+        lay.addWidget(input_lbl)
+        input_box = QTextEdit()
+        input_box.setFont(QFont(_FM, 9))
+        input_box.setPlaceholderText("在此粘贴或输入要测试的文本...")
+        lay.addWidget(input_box, 1)
+
+        result_lbl = QLabel("匹配结果:")
+        lay.addWidget(result_lbl)
+        result_box = QTextEdit()
+        result_box.setReadOnly(True)
+        result_box.setFont(QFont(_FM, 9))
+        lay.addWidget(result_box, 1)
+
+        def do_test():
+            text = input_box.toPlainText()
+            try:
+                pat = _re.compile(regex, _re.IGNORECASE)
+                matches = pat.findall(text)
+                if matches:
+                    if isinstance(matches[0], tuple):
+                        matches = [m.group(0) for m in pat.finditer(text)]
+                    result_box.setPlainText(f"找到 {len(matches)} 个匹配:\n" + "\n".join(str(m) for m in matches))
+                else:
+                    result_box.setPlainText("无匹配")
+            except _re.error as e:
+                result_box.setPlainText(f"正则错误: {e}")
+
+        btn_test = QPushButton("测试")
+        btn_test.clicked.connect(do_test)
+        lay.addWidget(btn_test)
+        dlg.exec()
+
+    def _ext_edit_pattern(self, name):
+        """编辑正则 — 替换该行为可编辑的 QLineEdit 行"""
+        info = self._ext_custom_patterns.get(name, "")
+        if isinstance(info, str):
+            pat = info; enabled = True
+        else:
+            pat = info.get("regex", ""); enabled = info.get("enabled", True)
+        c = _TH[self._tn]
+        # 找到并删除原行
+        lay = self._ext_pat_layout
+        idx = -1
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if w:
+                rl = w.layout()
+                if rl and rl.count() > 0:
+                    first = rl.itemAt(0).widget()
+                    if isinstance(first, QLabel) and first.text() == name:
+                        idx = i
+                        w.deleteLater()
+                        break
+        if idx < 0:
+            idx = lay.count() - 1  # before stretch
+        # 创建编辑行
+        row = QFrame()
+        row.setObjectName("_ext_edit_row")
+        row.setStyleSheet(
+            f"QFrame#_ext_edit_row {{ background: {c['input']}; border-radius: 8px; border: 1px solid {c['accent']}; }}"
+            f"QFrame#_ext_edit_row QLabel {{ background: transparent; border: none; }}"
+            f"QFrame#_ext_edit_row QLineEdit {{ border: 1px solid {c['border']}; border-radius: 4px; padding: 4px 6px; background: {c['card']}; color: {c['text1']}; }}")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(12, 6, 12, 6)
+        rl.setSpacing(6)
+        ent_name = QLineEdit(name)
+        ent_name.setFixedWidth(120)
+        rl.addWidget(ent_name)
+        ent_regex = QLineEdit(pat)
+        rl.addWidget(ent_regex, 1)
+        lbl_s = QLabel("启用" if enabled else "禁用")
+        lbl_s.setFixedWidth(50)
+        rl.addWidget(lbl_s)
+        btn_save = QPushButton("保存")
+        btn_save.setFixedWidth(50)
+        btn_save.clicked.connect(lambda: self._ext_save_edit(name, ent_name, ent_regex, enabled, row))
+        rl.addWidget(btn_save)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedWidth(50)
+        btn_cancel.setStyleSheet(
+            f"QPushButton {{ background: {c['error']}; color: #fff; border-radius: 6px; padding: 4px 8px; font-size: 9px; }}"
+            f"QPushButton:hover {{ background: #dc2626; }}")
+        btn_cancel.clicked.connect(lambda: (row.deleteLater(), self._ext_refresh_custom_patterns()))
+        rl.addWidget(btn_cancel)
+        lay.insertWidget(idx, row)
+        ent_name.setFocus()
+
+    def _ext_save_edit(self, old_name, ent_name, ent_regex, enabled, row_widget):
+        """保存编辑后的正则"""
+        new_name = ent_name.text().strip()
+        new_regex = ent_regex.text().strip()
+        if not new_name or not new_regex:
+            self._ext_log("栏目名和正则不能为空")
+            return
+        import re as _re
+        try:
+            _re.compile(new_regex)
+        except _re.error as e:
+            self._ext_log(f"正则语法错误: {e}")
+            return
+        self._ext_custom_patterns.pop(old_name, None)
+        self._ext_custom_patterns[new_name] = {"regex": new_regex, "enabled": enabled}
+        row_widget.deleteLater()
+        self._ext_refresh_custom_patterns()
+        self._auto_save()
+        self._ext_log(f"已保存规则: {new_name}")
+
+    def _ext_toggle_pattern(self, name):
+        """切换正则启用/禁用"""
+        info = self._ext_custom_patterns.get(name, "")
+        if isinstance(info, str):
+            self._ext_custom_patterns[name] = {"regex": info, "enabled": False}
+        else:
+            info["enabled"] = not info.get("enabled", True)
+        self._ext_refresh_custom_patterns()
+        self._auto_save()
+
+    def _ext_delete_pattern(self, name):
+        self._ext_custom_patterns.pop(name, None)
+        self._ext_refresh_custom_patterns()
+        self._auto_save()
+        self._ext_log(f"已删除规则: {name}")
 
     # ── 调试开关 (vConsole) ──
 
@@ -1526,6 +2789,7 @@ class App(QMainWindow):
         self._update_theme_label()
         self._update_toggle_colors()
         self._refresh_sb_app_card()
+        self._ext_refresh_custom_patterns()
         self._hl_sb()
         self._auto_save()
 
@@ -1535,7 +2799,7 @@ class App(QMainWindow):
 
     def _update_toggle_colors(self):
         c = _TH[self._tn]
-        for tog in (self._tog_dm, self._tog_df):
+        for tog in (self._tog_dm, self._tog_df, self._tog_auto_dec, self._tog_auto_scan):
             tog.set_colors(c["accent"], c["text4"])
 
     def _refresh_sb_app_card(self):
@@ -1550,11 +2814,14 @@ class App(QMainWindow):
     def _auto_save(self):
         data = {
             "theme": self._tn,
-            "debug_port": self._dp_ent.text(),
             "cdp_port": self._cp_ent.text(),
             "debug_main": self._tog_dm.isChecked(),
             "debug_frida": self._tog_df.isChecked(),
             "selected_preload_scripts": list(self._selected_preload),
+            "extract_packages_dir": self._ext_path_ent.text(),
+            "extract_custom_patterns": dict(self._ext_custom_patterns),
+            "auto_decompile": self._tog_auto_dec.isChecked(),
+            "auto_scan": self._tog_auto_scan.isChecked(),
         }
         _save_cfg(data)
 
@@ -1608,7 +2875,6 @@ class App(QMainWindow):
         if self._running:
             return
         try:
-            dp = int(self._dp_ent.text())
             cp = int(self._cp_ent.text())
         except ValueError:
             self._log_add("error", "[gui] 端口号无效")
@@ -1616,7 +2882,7 @@ class App(QMainWindow):
         scripts_dir = os.path.join(_BASE_DIR, "userscripts")
         selected_files = [os.path.join(scripts_dir, fn) for fn in self._selected_preload]
         opts = CliOptions(
-            debug_port=dp, cdp_port=cp,
+            cdp_port=cp,
             debug_main=self._tog_dm.isChecked(),
             debug_frida=self._tog_df.isChecked(),
             scripts_dir=scripts_dir,
@@ -1702,7 +2968,7 @@ class App(QMainWindow):
 
     def _nav_btns(self, on):
         for b in (self._btn_go, self._btn_relaunch,
-                  self._btn_back, self._btn_auto, self._btn_prev,
+                  self._btn_back, self._btn_refresh, self._btn_auto, self._btn_prev,
                   self._btn_next, self._btn_copy_route):
             b.setEnabled(on)
         self._guard_switch.setEnabled(on)
@@ -1776,6 +3042,7 @@ class App(QMainWindow):
         # 自动恢复云扫描
         if not self._cloud_scan_active and self._auditor:
             self._cloud_start_scan()
+            self._log_add("info", "[云扫描] 小程序连接后自动恢复捕获")
 
     def _delayed_fetch_app_info(self, gen):
         """延迟调用，只有最后一次触发的 gen 匹配才执行。"""
@@ -1855,6 +3122,29 @@ class App(QMainWindow):
             self._log_q.put(("info", "[导航] 已返回"))
         except Exception as e:
             self._log_q.put(("error", f"[导航] 返回失败: {e}"))
+
+    def _do_refresh(self):
+        if self._engine and self._loop:
+            asyncio.run_coroutine_threadsafe(self._arefresh(), self._loop)
+
+    async def _arefresh(self):
+        try:
+            result = await self._navigator.refresh_page()
+            if result:
+                import json as _json
+                try:
+                    info = _json.loads(result)
+                    if info.get("err"):
+                        self._log_q.put(("error", f"[导航] 刷新失败: {info['err']}"))
+                        return
+                    route = info.get("route", "")
+                    self._log_q.put(("info", f"[导航] 已刷新页面: /{route}"))
+                except (_json.JSONDecodeError, TypeError):
+                    self._log_q.put(("info", "[导航] 已刷新页面"))
+            else:
+                self._log_q.put(("info", "[导航] 已刷新页面"))
+        except Exception as e:
+            self._log_q.put(("error", f"[导航] 刷新失败: {e}"))
 
     def _do_autovis(self):
         if not self._navigator or not self._navigator.pages:
@@ -2281,6 +3571,12 @@ class App(QMainWindow):
             except queue.Empty:
                 break
             self._handle_cld(item)
+        for _ in range(50):
+            try:
+                item = self._ext_q.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_ext(item)
 
     def _apply_sts(self, sts):
         c = _TH[self._tn]
@@ -2467,11 +3763,93 @@ class App(QMainWindow):
                 self._cloud_result.setHtml(
                     f'<span style="color:{c["warning"]}">{name} -> {detail}</span>')
 
+    def _handle_ext(self, item):
+        kind = item.get("type", "")
+        c = _TH[self._tn]
+        op = self._ext_current_op  # ("decompile"/"scan", appid) or None
+
+        if kind == "progress":
+            done = item.get("done", 0)
+            total = item.get("total", 1)
+            if total > 0:
+                self._ext_prog.setValue(int((done / total) * 100))
+            self._ext_status_lbl.setText(f"进度: {done}/{total}")
+
+        elif kind == "log":
+            self._ext_log(item.get("msg", ""))
+
+        elif kind == "result":
+            data = item.get("data", {})
+            if op:
+                op_type, appid = op
+                if op_type == "decompile":
+                    # 反编译完成
+                    state = self._ext_app_states.setdefault(appid, {})
+                    state["decompiled"] = True
+                    decompile_dir = data.get("decompile_dir", "")
+                    if decompile_dir:
+                        state["decompile_dir"] = decompile_dir
+                    extracted = data.get("extracted", 0)
+                    self._ext_status_lbl.setText(f"反编译完成! {appid} 提取了 {extracted} 个文件")
+                    self._ext_status_lbl.setStyleSheet(f"color: {c['success']};")
+                    self._ext_update_app_buttons(appid)
+                    # 刷新名称显示（解包后可读取 app-config.json）
+                    widgets = self._ext_app_widgets.get(appid, {})
+                    if "lbl_name" in widgets:
+                        pkgs = state.get("packages", [])
+                        output_base = os.path.join(_BASE_DIR, "output")
+                        name = self._ext_get_app_name(appid, pkgs, output_base)
+                        widgets["lbl_name"].setText(name)
+
+                elif op_type == "scan":
+                    # 扫描完成
+                    state = self._ext_app_states.setdefault(appid, {})
+                    state["scanned"] = True
+                    result_dir = data.get("result_dir", "")
+                    if result_dir:
+                        state["result_dir"] = result_dir
+                    findings = data.get("findings", 0)
+                    self._ext_status_lbl.setText(f"扫描完成! {appid} 发现 {findings} 条敏感信息")
+                    self._ext_status_lbl.setStyleSheet(f"color: {c['success']};")
+                    self._ext_update_app_buttons(appid)
+
+        elif kind == "error":
+            self._ext_log(f"错误: {item.get('msg', '')}")
+            self._ext_status_lbl.setText("出错")
+            self._ext_status_lbl.setStyleSheet(f"color: {c['error']};")
+
+        elif kind == "__done__":
+            self._ext_proc = None
+            prev_op = self._ext_current_op
+            self._ext_current_op = None
+            self._ext_prog.setValue(100)
+            rc = item.get("returncode", -1)
+            if rc != 0 and "完成" not in self._ext_status_lbl.text():
+                self._ext_status_lbl.setText(f"进程退出 (code={rc})")
+                self._ext_status_lbl.setStyleSheet(f"color: {c['error']};")
+
+            # 自动处理链: 反编译完成后 → 自动扫描; 扫描完成后 → 处理下一个
+            if prev_op and rc == 0:
+                op_type, appid = prev_op
+                if op_type == "decompile" and self._tog_auto_scan.isChecked():
+                    state = self._ext_app_states.get(appid, {})
+                    if state.get("decompiled") and not state.get("scanned"):
+                        QTimer.singleShot(500, lambda a=appid: self._ext_do_scan(a))
+                        return
+                # 继续处理其他未完成的小程序
+                QTimer.singleShot(500, self._ext_auto_process_pending)
     # ──────────────────────────────────
     #  退出
     # ──────────────────────────────────
 
     def closeEvent(self, event):
+        if self._ext_proc:
+            try:
+                self._ext_proc.kill()  # 强制杀死子进程
+                self._ext_proc.wait(timeout=2)
+            except Exception:
+                pass
+            self._ext_proc = None
         if self._running:
             self._do_stop()
             QTimer.singleShot(400, lambda: QApplication.quit())

@@ -72,11 +72,6 @@ const hookOnLoadScene = (a1, sceneOffsets) => {
     }
     send("[hook] hook scene condition -> 1101");
     miniappScenePtr.writeInt(1101);
-
-    // TODO: customize debugging endpoint
-    // const websocketServerStringPtr = passArgs.add(8).readPointer().add(520);
-    // VERBOSE && console.log("[hook] hook websocket server, original: ", websocketServerStringPtr.readUtf8String());
-    // websocketServerStringPtr.writeUtf8String("ws://127.0.0.1:8189/");
 };
 
 const patchOnLoadStart = (base, config) => {

@@ -25,6 +25,7 @@ class CloudAuditor:
         """启动全局 Hook：注入 JS，安装 hook，启动自动扫描新 frame"""
         if self._enabled:
             return {"ok": True, "already": True}
+        self._injected = False  # 强制重新注入（连接可能已更换）
         await self.inject()
         result = await self.engine.evaluate_js(
             "JSON.stringify(window.cloudAudit.installHook())", timeout=5.0)
@@ -52,11 +53,23 @@ class CloudAuditor:
             pass
 
     async def poll(self):
-        """拉取新捕获的云函数调用，只返回增量"""
+        """拉取新捕获的云函数调用，只返回增量。
+        自动检测 Hook 是否丢失（页面切换后），并重新注入。
+        """
         if not self._enabled:
             return []
         try:
             await self.inject()
+            # 检查 Hook 是否仍然存活（页面导航后可能丢失）
+            alive_result = await self.engine.evaluate_js(
+                "(function(){try{return window.cloudAudit&&window.cloudAudit._hooked?'1':'0'}catch(e){return '0'}})()",
+                timeout=3.0)
+            alive = self._extract_value(alive_result)
+            if alive != '1':
+                # Hook 丢失（页面切换/刷新），重新安装
+                await self.engine.evaluate_js(
+                    "JSON.stringify(window.cloudAudit.installHook())", timeout=5.0)
+                self._seen_count = 0  # 重置计数器，新上下文从 0 开始
             result = await self.engine.evaluate_js(
                 "JSON.stringify(window.cloudAudit.getHookedCalls())", timeout=5.0)
             value = self._extract_value(result)

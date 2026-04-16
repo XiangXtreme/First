@@ -18,8 +18,13 @@
 ### 调试开关(JSRPC 与调用 wx.cloud)
 ![调试](https://s1.galgame.fun/imgb/u0/20260408_69d6564195009.png)
 
-### 安全扫描
-待优化
+### 敏感信息提取
+
+![PixPin_2026-04-16_18-45-08](https://s1.galgame.fun/imgb/u55/20260416_69e0be0e1c1d7.png)
+
+<img src="https://s1.galgame.fun/imgb/u55/20260416_69e0be0c38e39.png" alt="PixPin_2026-04-16_18-45-59" />
+
+![PixPin_2026-04-16_18-45-52](https://s1.galgame.fun/imgb/u55/20260416_69e0be0c70d46.png)
 
 ---
 
@@ -60,7 +65,7 @@ pip install -r requirements.txt
    16815, 16965, 17037, 17071, 17127, 18055, 18151, 18787, 18891, 18955, 19027, 19201  
 - 推荐微信版本为4.1.0.30
 - 下载地址[weixin/4.1.0.30](https://github.com/vs-olitus/wx-version/releases/tag/4.1.0.30)
- 
+
 ## 使用方法
 
 ### GUI 模式（推荐）
@@ -82,7 +87,7 @@ python gui.py
 python main.py
 
 # 自定义端口
-python main.py --debug-port 9421 --cdp-port 62000
+python main.py --cdp-port 62000
 
 # 开启详细日志
 python main.py --debug-main --debug-frida
