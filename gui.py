@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QFrame, QPushButton, QScrollArea, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QProgressBar, QStackedWidget,
     QMenu, QHeaderView, QAbstractItemView, QFileDialog, QInputDialog,
-    QTabWidget, QTableWidget, QTableWidgetItem, QDialog,
+    QTabWidget, QTableWidget, QTableWidgetItem, QDialog, QSizePolicy,
 )
 
 from src.cli import CliOptions, CDP_PORT
@@ -2185,13 +2185,11 @@ class App(QMainWindow):
                 except Exception:
                     pass
         self._ext_log(f"已清空 {count} 个小程序的解包文件")
-        # 刷新状态
+        # 刷新状态（不触发自动处理，用户主动清空不应自动重跑）
         for appid in self._ext_app_states:
             self._ext_app_states[appid]["decompiled"] = False
             self._ext_app_states[appid]["scanned"] = False
             self._ext_update_app_buttons(appid)
-        # 如果开启了自动反编译，重新处理
-        QTimer.singleShot(500, self._ext_auto_process_pending)
 
     def _ext_clear_applet(self):
         """清空 Applet 目录"""
@@ -2206,6 +2204,9 @@ class App(QMainWindow):
                 if os.path.isdir(full):
                     shutil.rmtree(full)
             self._ext_log("已清空 Applet 目录")
+            # 清空后重置已知 appid 集合，防止旧 appid 触发自动反编译
+            self._ext_app_states.clear()
+            self._ext_last_appids = set()
             self._ext_refresh_apps()
         except Exception as e:
             self._ext_log(f"清空失败: {e}")
@@ -2257,10 +2258,11 @@ class App(QMainWindow):
             lbl_n.setFont(QFont(_FM, 9))
             lbl_n.setStyleSheet(f"color: {c['text1']};")
             rl.addWidget(lbl_n)
-            lbl_p = QLabel(pat if len(pat) < 80 else pat[:80] + "...")
+            lbl_p = QLabel(pat if len(pat) < 60 else pat[:60] + "...")
             lbl_p.setFont(QFont(_FM, 9))
             lbl_p.setStyleSheet(f"color: {c['text2']};")
             lbl_p.setToolTip(pat)
+            lbl_p.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             rl.addWidget(lbl_p, 1)
             lbl_s = QLabel("启用" if enabled else "禁用")
             lbl_s.setFixedWidth(50)
@@ -2364,11 +2366,28 @@ class App(QMainWindow):
         info = self._ext_custom_patterns.get(name, "")
         regex = info.get("regex", info) if isinstance(info, dict) else info
         import re as _re
+        c = _TH[self._tn]
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"测试正则 - {name}")
         dlg.resize(600, 400)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {c['bg']}; color: {c['text1']}; }}
+            QLabel {{ color: {c['text2']}; background: transparent; }}
+            QTextEdit {{
+                background: {c['input']}; color: {c['text1']};
+                border: 1px solid {c['border']}; border-radius: 8px;
+                padding: 6px; font-family: {_FM};
+            }}
+            QPushButton {{
+                background: {c['accent']}; color: #111;
+                border-radius: 8px; padding: 8px 16px; font-size: 13px;
+            }}
+            QPushButton:hover {{ background: {c['accent2']}; }}
+        """)
         lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(8)
 
         lay.addWidget(QLabel(f"正则: {regex}"))
 
