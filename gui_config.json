@@ -3,7 +3,6 @@
   "cdp_port": "62000",
   "debug_main": false,
   "debug_frida": false,
-  "extract_packages_dir": "",
   "extract_custom_patterns": {},
   "auto_decompile": false,
   "auto_scan": false,

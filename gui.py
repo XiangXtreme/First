@@ -1048,6 +1048,7 @@ class App(QMainWindow):
         self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._nav_context_menu)
+        self._tree.itemDoubleClicked.connect(self._do_tree_double_click)
         tc_lay.addWidget(self._tree)
         lay.addWidget(tc, 1)
 
@@ -1582,10 +1583,7 @@ class App(QMainWindow):
         # 自动检测默认路径
         from src.wxapkg import get_default_packages_dir
         default_pkg = get_default_packages_dir() or ""
-        saved_path = self._cfg.get("extract_packages_dir", "")
-        if saved_path:
-            self._ext_path_ent.setText(saved_path)
-        elif default_pkg:
+        if default_pkg:
             self._ext_path_ent.setText(default_pkg)
         # 先连接信号，然后手动刷新一次（setText 不会重复触发因为信号在之后连接）
         # 注意: setText 在信号连接前调用，所以不会触发重复刷新
@@ -3097,7 +3095,6 @@ class App(QMainWindow):
             "cdp_port": self._cp_ent.text(),
             "debug_main": self._tog_dm.isChecked(),
             "debug_frida": self._tog_df.isChecked(),
-            "extract_packages_dir": self._ext_path_ent.text(),
             "extract_custom_patterns": dict(self._ext_custom_patterns),
             "auto_decompile": self._tog_auto_dec.isChecked(),
             "auto_scan": self._tog_auto_scan.isChecked(),
@@ -3383,6 +3380,13 @@ class App(QMainWindow):
                 self._nav_route_idx = self._flat_routes.index(r)
             asyncio.run_coroutine_threadsafe(
                 self._anav("navigate_to", r, "跳转"), self._loop)
+
+    def _do_tree_double_click(self, item, _column):
+        route = item.data(0, Qt.UserRole) if item else None
+        if not route:
+            return
+        self._tree.setCurrentItem(item)
+        self._do_go()
 
     def _do_relaunch(self):
         r = self._sel_route()
