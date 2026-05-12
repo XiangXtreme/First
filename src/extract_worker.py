@@ -46,7 +46,7 @@ def do_decompile(args):
     if base_dir not in sys.path:
         sys.path.insert(0, base_dir)
 
-    from src.wxapkg import find_wxapkg_files, extract_wxapkg
+    from src.wxapkg import find_wxapkg_files, extract_wxapkg, write_manifest
 
     packages_dir = args.packages_dir
     appid = args.appid
@@ -58,7 +58,10 @@ def do_decompile(args):
 
     # 查找该 appid 的包
     all_pkgs = find_wxapkg_files(packages_dir)
-    pkgs = [p for p in all_pkgs if p["appid"] == appid]
+    pkgs = sorted(
+        [p for p in all_pkgs if p["appid"] == appid],
+        key=lambda p: p.get("path", "")
+    )
 
     if not pkgs:
         _emit({"type": "log", "msg": f"未找到 {appid} 的 wxapkg 文件"})
@@ -72,21 +75,37 @@ def do_decompile(args):
 
     total = len(pkgs)
     extracted_total = 0
+    manifest_packages = []
 
     for i, pkg in enumerate(pkgs, 1):
         try:
-            files = extract_wxapkg(pkg["path"], decompile_dir, appid)
+            pkg_info = {
+                "appid": appid,
+                "name": pkg["name"],
+                "path": pkg["path"],
+                "size": pkg.get("size", os.path.getsize(pkg["path"])),
+                "mtime": os.path.getmtime(pkg["path"]),
+                "files": [],
+            }
+            files = extract_wxapkg(pkg["path"], decompile_dir, appid, pkg_info)
+            manifest_packages.append(pkg_info)
             extracted_total += len(files)
             _emit({"type": "log", "msg": f"  解包 {pkg['name']}: {len(files)} 个文件"})
         except Exception as e:
             _emit({"type": "log", "msg": f"  解包失败 {pkg['name']}: {e}"})
         _emit({"type": "progress", "done": i, "total": total})
 
+    manifest_path = ""
+    if manifest_packages:
+        manifest_path = write_manifest(appid, manifest_packages, output_dir)
+        _emit({"type": "log", "msg": f"已生成 manifest: {manifest_path}"})
+
     _emit({"type": "result", "data": {
         "appid": appid,
         "files": total,
         "extracted": extracted_total,
         "decompile_dir": decompile_dir,
+        "manifest_path": manifest_path,
     }})
     _emit({"type": "log", "msg": f"反编译完成! 共提取 {extracted_total} 个文件"})
 

@@ -15,14 +15,17 @@ from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, Property, QRect,
     Signal, QPoint, QUrl,
 )
-from PySide6.QtGui import QPainter, QColor, QFont, QIcon, QPixmap, QDesktopServices
+from PySide6.QtGui import (
+    QPainter, QColor, QFont, QIcon, QPixmap, QDesktopServices,
+    QTextCursor, QTextCharFormat,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QFrame, QPushButton, QScrollArea, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QProgressBar, QStackedWidget,
     QMenu, QHeaderView, QAbstractItemView, QFileDialog, QInputDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QDialog, QSizePolicy,
-    QCheckBox,
+    QCheckBox, QMessageBox,
 )
 
 from src.cli import CliOptions, CDP_PORT
@@ -30,6 +33,17 @@ from src.logger import Logger
 from src.engine import DebugEngine
 from src.navigator import MiniProgramNavigator
 from src.cloud_audit import CloudAuditor
+from src.code_beautify import beautify_text
+from src.runtime_patch import (
+    build_api_hook_js,
+    build_behavior_hook_js,
+    build_page_method_hook_js,
+    build_runtime_patch,
+    build_text_patch_js,
+    count_runtime_patch_changed,
+    extract_runtime_value,
+    runtime_patch_hit_summary,
+)
 
 # ══════════════════════════════════════════
 #  配色
@@ -65,6 +79,7 @@ _MENU = [
     ("targets",   "◎", "服务目标"),
     ("cloud",     "☁", "云扫描"),
     ("extract",   "◆", "敏感信息提取"),
+    ("modify",    "✎", "代码修改"),
     ("vconsole",  "◇", "调试开关"),
     ("logs",      "≡", "运行日志"),
 ]
@@ -738,6 +753,8 @@ class App(QMainWindow):
         self._ext_app_states = {}   # {appid: {"decompiled": bool, "scanned": bool, ...}}
         self._ext_app_widgets = {}  # {appid: row widget ref}
         self._ext_current_op = None  # ("decompile"/"scan", appid) or None
+        self._mod_app_widgets = {}
+        self._runtime_patch_busy = False
 
         self._build()
         self.setStyleSheet(build_qss(self._tn))
@@ -915,6 +932,7 @@ class App(QMainWindow):
         self._build_targets()
         self._build_cloud()
         self._build_extract()
+        self._build_modify()
         self._build_vconsole()
         self._build_logs()
 
@@ -2166,6 +2184,735 @@ class App(QMainWindow):
         self._ext_thread.start()
 
     # ============================================
+    # 代码修改页
+    # ============================================
+
+    def _build_modify(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 12, 24, 16)
+        lay.setSpacing(10)
+
+        top = QHBoxLayout()
+        top.addWidget(_make_label("选择已反编译的小程序后编辑代码并应用运行时修改", muted=True))
+        top.addStretch()
+        self._btn_mod_refresh = _make_btn("刷新", self._mod_refresh_apps)
+        top.addWidget(self._btn_mod_refresh)
+        lay.addLayout(top)
+
+        list_card = _make_card()
+        list_lay = QVBoxLayout(list_card)
+        list_lay.setContentsMargins(0, 6, 0, 6)
+        list_lay.setSpacing(0)
+
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(16, 4, 16, 4)
+        hdr_appid = _make_label("AppID", bold=True)
+        hdr_appid.setFixedWidth(190)
+        hdr.addWidget(hdr_appid)
+        hdr_name = _make_label("目录", bold=True)
+        hdr.addWidget(hdr_name, 1)
+        hdr.addWidget(_make_label("操作", bold=True))
+        list_lay.addLayout(hdr)
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(128,128,128,0.2);")
+        list_lay.addWidget(sep)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._mod_list_inner = QWidget()
+        self._mod_list_layout = QVBoxLayout(self._mod_list_inner)
+        self._mod_list_layout.setContentsMargins(8, 4, 8, 4)
+        self._mod_list_layout.setSpacing(4)
+        self._mod_list_layout.addStretch()
+        scroll.setWidget(self._mod_list_inner)
+        list_lay.addWidget(scroll, 1)
+        lay.addWidget(list_card, 1)
+
+        self._mod_status_lbl = QLabel("请先在“敏感信息提取”中反编译目标小程序")
+        self._mod_status_lbl.setProperty("class", "muted")
+        lay.addWidget(self._mod_status_lbl)
+
+        self._mod_logbox = QTextEdit()
+        self._mod_logbox.setReadOnly(True)
+        self._mod_logbox.setFont(_qfm())
+        self._mod_logbox.setMaximumHeight(120)
+        lay.addWidget(self._mod_logbox)
+
+        self._stack.addWidget(page)
+        self._page_map["modify"] = self._stack.count() - 1
+        QTimer.singleShot(800, self._mod_refresh_apps)
+
+    def _mod_log(self, msg):
+        c = _TH[self._tn]
+        self._mod_logbox.append(f'<span style="color:{c["text2"]}">{msg}</span>')
+        sb = self._mod_logbox.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _mod_refresh_apps(self):
+        if not hasattr(self, "_mod_list_layout"):
+            return
+        while self._mod_list_layout.count() > 1:
+            item = self._mod_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._mod_app_widgets.clear()
+
+        output_base = os.path.join(_BASE_DIR, "output")
+        apps = []
+        if os.path.isdir(output_base):
+            for appid in os.listdir(output_base):
+                app_output = os.path.join(output_base, appid)
+                decompile_dir = os.path.join(app_output, "decompiled")
+                manifest_path = os.path.join(app_output, "manifest.json")
+                if os.path.isdir(decompile_dir) and os.path.isfile(manifest_path):
+                    apps.append((appid, app_output, decompile_dir))
+
+        c = _TH[self._tn]
+        for appid, app_output, decompile_dir in sorted(apps):
+            row = QFrame()
+            row.setStyleSheet(
+                f"QFrame {{ background: {c['input']}; border-radius: 8px; }}"
+                f"QFrame QLabel {{ background: transparent; }}"
+            )
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(12, 6, 12, 6)
+            row_lay.setSpacing(6)
+
+            lbl_id = QLabel(appid)
+            lbl_id.setFixedWidth(190)
+            lbl_id.setFont(_qfm())
+            lbl_id.setStyleSheet(f"color: {c['text1']};")
+            row_lay.addWidget(lbl_id)
+
+            lbl_dir = QLabel(decompile_dir)
+            lbl_dir.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl_dir.setStyleSheet(f"color: {c['text2']};")
+            row_lay.addWidget(lbl_dir, 1)
+
+            btn_edit = QPushButton("编辑代码")
+            btn_edit.setFixedWidth(70)
+            btn_edit.clicked.connect(lambda _, a=appid: self._mod_edit_code(a))
+            row_lay.addWidget(btn_edit)
+
+            btn_runtime = QPushButton("运行时修改")
+            btn_runtime.setFixedWidth(78)
+            btn_runtime.clicked.connect(lambda _, a=appid: self._mod_apply_runtime_patch(a))
+            row_lay.addWidget(btn_runtime)
+
+            btn_open = QPushButton("打开目录")
+            btn_open.setFixedWidth(70)
+            btn_open.clicked.connect(lambda _, a=appid: self._mod_open_app_output(a))
+            row_lay.addWidget(btn_open)
+
+            self._mod_app_widgets[appid] = {
+                "row": row,
+                "appid": lbl_id,
+                "dir": lbl_dir,
+                "app_output": app_output,
+                "decompile_dir": decompile_dir,
+            }
+            self._mod_list_layout.insertWidget(self._mod_list_layout.count() - 1, row)
+
+        if apps:
+            self._mod_status_lbl.setText(f"发现 {len(apps)} 个已反编译小程序")
+        else:
+            self._mod_status_lbl.setText("没有已反编译的小程序，请先到“敏感信息提取”执行反编译")
+
+    def _mod_state_for_app(self, appid):
+        output_base = os.path.join(_BASE_DIR, "output")
+        app_output = os.path.join(output_base, appid)
+        decompile_dir = os.path.join(app_output, "decompiled")
+        return {"decompiled": os.path.isdir(decompile_dir), "decompile_dir": decompile_dir}
+
+    def _mod_open_app_output(self, appid):
+        self._open_app_output(appid)
+
+    def _mod_edit_code(self, appid):
+        self._open_code_editor(appid, self._mod_state_for_app(appid), self._mod_log)
+
+    def _mod_apply_runtime_patch(self, appid):
+        self._apply_runtime_patch_for_app(
+            appid,
+            self._mod_state_for_app(appid),
+            self._mod_log,
+            self._mod_status_lbl,
+        )
+
+    def _apply_runtime_patch_for_app(self, appid, state, log_func, status_label):
+        if self._runtime_patch_busy:
+            log_func("运行时修改正在执行，请等待完成")
+            return
+        if not self._engine or not self._loop or not self._loop.is_running() or not self._miniapp_connected:
+            log_func("请先在控制台启动调试，并重新打开目标小程序直到显示已连接")
+            status_label.setText("运行时修改需要先连接小程序")
+            return
+
+        decompile_dir = state.get("decompile_dir")
+        if not decompile_dir or not os.path.isdir(decompile_dir):
+            log_func(f"请先反编译 {appid}")
+            return
+
+        output_base = os.path.join(_BASE_DIR, "output")
+        patch = build_runtime_patch(appid, decompile_dir, output_base)
+        if not patch.get("pairs") and not patch.get("api_pairs") and not patch.get("page_methods"):
+            log_func("未自动识别到可应用的文本替换，请确认已保存修改且目标文本存在于原包")
+            status_label.setText("未识别到文本替换")
+            return
+
+        log_func(
+            f"开始运行时修改: {appid} ({len(patch.get('pairs', []))} 条文本替换 / "
+            f"{len(patch.get('api_pairs', []))} 条API参数替换 / {len(patch.get('page_methods', []))} 个页面方法)"
+        )
+        for old, new in (patch.get("pairs", []) + patch.get("api_pairs", []))[:5]:
+            log_func(f"  替换: {old} -> {new}")
+        status_label.setText("正在应用运行时修改...")
+        self._runtime_patch_busy = True
+        fut = asyncio.run_coroutine_threadsafe(self._aext_apply_runtime_patch(appid, patch), self._loop)
+        fut.add_done_callback(lambda f: self._rte_q.put(("__runtime_patch__", f, log_func, status_label)))
+
+    async def _aext_apply_runtime_patch(self, appid, patch):
+        guard = await self._aext_verify_runtime_appid(appid)
+        if not guard.get("ok"):
+            current = guard.get("current") or "未知"
+            raise RuntimeError(f"当前连接小程序 AppID={current}，与目标 {appid} 不一致，已取消运行时修改")
+        text_before = await self._aext_apply_text_patch(patch.get("pairs", []), require_contexts=True)
+        api_before = await self._aext_apply_api_hook(patch.get("api_pairs", []), require_contexts=True)
+        method_before = await self._aext_apply_page_method_hook(patch.get("page_methods", []), require_contexts=True)
+        behavior_before = await self._aext_apply_behavior_hook(patch.get("page_methods", []), require_contexts=True)
+        refresh_result = ""
+        try:
+            if self._navigator:
+                refresh_result = await self._navigator.refresh_page()
+                await asyncio.sleep(1.5)
+        except Exception as e:
+            refresh_result = f"refresh failed: {e}"
+        text_after = await self._aext_apply_text_patch(patch.get("pairs", []), require_contexts=True)
+        api_after = await self._aext_apply_api_hook(patch.get("api_pairs", []), require_contexts=True)
+        method_after = await self._aext_apply_page_method_hook(patch.get("page_methods", []), require_contexts=True)
+        behavior_after = await self._aext_apply_behavior_hook(patch.get("page_methods", []), require_contexts=True)
+        return {
+            "text_before": text_before,
+            "api_before": api_before,
+            "method_before": method_before,
+            "behavior_before": behavior_before,
+            "refresh": refresh_result,
+            "text_after": text_after,
+            "api_after": api_after,
+            "method_after": method_after,
+            "behavior_after": behavior_after,
+            "guard": guard,
+        }
+
+    async def _aext_verify_runtime_appid(self, expected_appid):
+        js = """
+(() => {
+  try {
+    const pick = (c) => {
+      c = c || {};
+      const ai = c.accountInfo || {};
+      const aa = ai.appAccount || {};
+      return aa.appId || ai.appId || c.appid || c.appId || '';
+    };
+    const nav = typeof window !== 'undefined' ? window.nav : null;
+    const wxFrame = nav && nav.wxFrame;
+    const candidates = [
+      nav && nav.config && (nav.config.appid || nav.config.appId),
+      wxFrame && pick(wxFrame.__wxConfig),
+      typeof window !== 'undefined' && pick(window.__wxConfig),
+      typeof window !== 'undefined' && window.wx && pick(window.wx.__wxConfig),
+      typeof __wxConfig !== 'undefined' && pick(__wxConfig)
+    ];
+    for (const value of candidates) {
+      if (value) return JSON.stringify({ok:true, appid:String(value)});
+    }
+    return JSON.stringify({ok:false, appid:''});
+  } catch (e) {
+    return JSON.stringify({ok:false, err:String(e && e.message || e)});
+  }
+})()
+"""
+        result = await self._aext_evaluate_patch_all_contexts(js, require_contexts=True)
+        found = []
+        for item in result.get("results", []):
+            value = item.get("value") if isinstance(item, dict) else None
+            if isinstance(value, dict) and value.get("appid"):
+                found.append(str(value.get("appid")))
+        unique = []
+        for value in found:
+            if value not in unique:
+                unique.append(value)
+        if not unique:
+            return {"ok": False, "expected": expected_appid, "current": ""}
+        if expected_appid in unique:
+            return {"ok": True, "expected": expected_appid, "current": expected_appid, "all": unique}
+        return {"ok": False, "expected": expected_appid, "current": unique[0], "all": unique}
+
+    async def _aext_apply_text_patch(self, pairs, require_contexts=False):
+        if not pairs:
+            return {"pairs": 0, "changed": 0}
+        return await self._aext_evaluate_patch_all_contexts(build_text_patch_js(pairs), require_contexts=require_contexts)
+
+    async def _aext_apply_api_hook(self, api_pairs, require_contexts=False):
+        if not api_pairs:
+            return {"pairs": 0, "changed": 0}
+        return await self._aext_evaluate_patch_all_contexts(build_api_hook_js(api_pairs), require_contexts=require_contexts)
+
+    async def _aext_apply_page_method_hook(self, methods, require_contexts=False):
+        if not methods:
+            return {"methods": 0, "changed": 0}
+        return await self._aext_evaluate_patch_all_contexts(build_page_method_hook_js(methods), require_contexts=require_contexts)
+
+    async def _aext_apply_behavior_hook(self, methods, require_contexts=False):
+        if not methods:
+            return {"methods": 0, "changed": 0}
+        js = build_behavior_hook_js(methods)
+        if not js:
+            return {"methods": len(methods), "changed": 0}
+        return await self._aext_evaluate_patch_all_contexts(js, require_contexts=require_contexts)
+
+    async def _aext_evaluate_patch_all_contexts(self, expression, require_contexts=False):
+        contexts = []
+
+        def on_ctx(evt):
+            ctx = evt.get("params", {}).get("context", {})
+            cid = ctx.get("id")
+            if cid is not None and cid not in [c.get("id") for c in contexts]:
+                contexts.append({
+                    "id": cid,
+                    "name": ctx.get("name", ""),
+                    "origin": ctx.get("origin", ""),
+                    "auxData": ctx.get("auxData", {}),
+                })
+
+        self._engine.on_cdp_event("Runtime.executionContextCreated", on_ctx)
+        try:
+            try:
+                await self._engine.send_cdp_command("Runtime.disable", timeout=2.0)
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+            await self._engine.send_cdp_command("Runtime.enable", timeout=5.0)
+            deadline = asyncio.get_event_loop().time() + 2.5
+            while not contexts and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+        finally:
+            self._engine.off_cdp_event("Runtime.executionContextCreated", on_ctx)
+
+        results = []
+        total_changed = 0
+        if not contexts:
+            if require_contexts:
+                raise RuntimeError("未获取到小程序运行上下文，请等待小程序连接稳定后重试")
+            result = await self._engine.evaluate_js(expression, timeout=10.0)
+            value = extract_runtime_value(result)
+            changed = count_runtime_patch_changed(value)
+            return {"contexts": 0, "changed": changed, "results": [value or result]}
+
+        for ctx in contexts:
+            try:
+                result = await self._engine.send_cdp_command(
+                    "Runtime.evaluate",
+                    {
+                        "expression": expression,
+                        "returnByValue": True,
+                        "contextId": ctx["id"],
+                    },
+                    timeout=10.0,
+                )
+                value = extract_runtime_value(result)
+                total_changed += count_runtime_patch_changed(value)
+                results.append({"context": ctx, "value": value})
+            except Exception as e:
+                results.append({"context": ctx, "error": str(e)})
+        return {"contexts": len(contexts), "changed": total_changed, "results": results[:20]}
+
+    def _open_app_output(self, appid):
+        output_base = os.path.join(_BASE_DIR, "output")
+        app_output = os.path.join(output_base, appid)
+        os.makedirs(app_output, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(app_output))
+
+    def _open_code_editor(self, appid, state=None, log_func=None):
+        state = state or self._ext_app_states.get(appid, {})
+        log_func = log_func or self._ext_log
+        if not state.get("decompiled"):
+            log_func(f"请先反编译 {appid}")
+            return
+
+        output_base = os.path.join(_BASE_DIR, "output")
+        app_output = os.path.join(output_base, appid)
+        decompile_dir = state.get("decompile_dir", os.path.join(app_output, "decompiled"))
+        if not os.path.isdir(decompile_dir):
+            log_func(f"解包目录不存在: {decompile_dir}")
+            return
+
+        c = _TH[self._tn]
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"编辑代码 - {appid}")
+        dlg.resize(1120, 760)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {c['bg']}; color: {c['text1']}; }}
+            QLabel {{ color: {c['text2']}; background: transparent; }}
+            QTreeWidget {{
+                background: {c['card']}; color: {c['text2']};
+                border: 1px solid {c['border']}; border-radius: 8px;
+            }}
+            QTextEdit {{
+                background: {c['input']}; color: {c['text1']};
+                border: 1px solid {c['border']}; border-radius: 8px;
+                padding: 8px; font-family: {_FM}; font-size: {_FM_SIZE}px;
+            }}
+            QPushButton {{
+                background: {c['input']}; color: {c['text1']};
+                border: 1px solid {c['border']}; border-radius: 6px;
+                padding: 5px 10px;
+            }}
+            QPushButton:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
+            QPushButton:disabled {{ color: {c['text3']}; border-color: {c['border']}; }}
+        """)
+
+        root_lay = QVBoxLayout(dlg)
+        root_lay.setContentsMargins(14, 12, 14, 12)
+        root_lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        title = QLabel(f"{appid} / decompiled")
+        title.setFont(_qfn(1, QFont.Weight.Bold))
+        top.addWidget(title)
+        path_lbl = QLabel(decompile_dir)
+        path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        top.addWidget(path_lbl, 1)
+        root_lay.addLayout(top)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        file_col = QVBoxLayout()
+        file_filter = QLineEdit()
+        file_filter.setPlaceholderText("搜索文件名...")
+        file_col.addWidget(file_filter)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["文件"])
+        tree.setRootIsDecorated(False)
+        tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        tree.setFont(_qfm())
+        tree.setMinimumWidth(320)
+        file_col.addWidget(tree, 1)
+        body.addLayout(file_col, 1)
+
+        editor_col = QVBoxLayout()
+        file_lbl = QLabel("请选择文件")
+        file_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        editor_col.addWidget(file_lbl)
+        search_row = QHBoxLayout()
+        search_ent = QLineEdit()
+        search_ent.setPlaceholderText("搜索当前文件内容...")
+        search_prev = QPushButton("上一个")
+        search_next = QPushButton("下一个")
+        search_status = QLabel("0/0")
+        search_prev.setFixedWidth(64)
+        search_next.setFixedWidth(64)
+        search_status.setFixedWidth(70)
+        search_row.addWidget(search_ent, 1)
+        search_row.addWidget(search_prev)
+        search_row.addWidget(search_next)
+        search_row.addWidget(search_status)
+        editor_col.addLayout(search_row)
+        editor = QTextEdit()
+        editor.setFont(_qfm())
+        editor.setLineWrapMode(QTextEdit.NoWrap)
+        editor.setEnabled(False)
+        editor_col.addWidget(editor, 1)
+        body.addLayout(editor_col, 3)
+        root_lay.addLayout(body, 1)
+
+        btn_row = QHBoxLayout()
+        btn_open_dir = QPushButton("打开目录")
+        btn_reload = QPushButton("重载")
+        btn_beautify = QPushButton("美化")
+        btn_save = QPushButton("保存")
+        btn_close = QPushButton("关闭")
+        btn_beautify.setEnabled(False)
+        btn_save.setEnabled(False)
+        btn_row.addWidget(btn_open_dir)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_reload)
+        btn_row.addWidget(btn_beautify)
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_close)
+        root_lay.addLayout(btn_row)
+
+        text_exts = {
+            ".js", ".json", ".wxml", ".wxss", ".html", ".htm", ".css",
+            ".txt", ".xml", ".svg", ".map", ".ts", ".wxs", ".md",
+        }
+        current = {"path": "", "rel": "", "dirty": False}
+        all_file_items = []
+        search_state = {"matches": [], "index": -1}
+
+        def safe_abs(rel_path):
+            full = os.path.abspath(os.path.join(decompile_dir, rel_path))
+            base = os.path.abspath(decompile_dir)
+            if full != base and full.startswith(base + os.sep):
+                return full
+            raise ValueError("非法路径")
+
+        def mark_dirty():
+            if current["path"]:
+                current["dirty"] = True
+                if not file_lbl.text().endswith(" *"):
+                    file_lbl.setText(file_lbl.text() + " *")
+
+        def refill_tree(filter_text=""):
+            selected_rel = current["rel"]
+            tree.blockSignals(True)
+            tree.clear()
+            needle = filter_text.strip().lower()
+            first_item = None
+            selected_item = None
+            for rel in all_file_items:
+                if needle and needle not in rel.lower():
+                    continue
+                item = QTreeWidgetItem([rel])
+                item.setData(0, Qt.UserRole, rel)
+                tree.addTopLevelItem(item)
+                if first_item is None:
+                    first_item = item
+                if rel == selected_rel:
+                    selected_item = item
+            if selected_item is not None:
+                tree.setCurrentItem(selected_item)
+            tree.blockSignals(False)
+            if tree.topLevelItemCount() == 0:
+                file_lbl.setText("未找到匹配文件")
+            elif not current["rel"] and first_item is not None:
+                tree.setCurrentItem(first_item)
+                on_select()
+
+        def list_files():
+            all_file_items.clear()
+            items = []
+            for root, _dirs, files in os.walk(decompile_dir):
+                for fn in files:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext not in text_exts:
+                        continue
+                    full = os.path.join(root, fn)
+                    try:
+                        rel = os.path.relpath(full, decompile_dir).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    items.append(rel)
+            all_file_items.extend(sorted(items))
+            refill_tree(file_filter.text())
+            if not items:
+                file_lbl.setText("未找到可编辑文本文件")
+
+        def clear_search_highlight():
+            extra = []
+            editor.setExtraSelections(extra)
+            search_state["matches"] = []
+            search_state["index"] = -1
+            search_status.setText("0/0")
+
+        def update_search_highlight(keep_index=False):
+            query = search_ent.text()
+            if not query:
+                clear_search_highlight()
+                return
+            text = editor.toPlainText()
+            matches = []
+            start = 0
+            query_lower = query.lower()
+            text_lower = text.lower()
+            while True:
+                pos = text_lower.find(query_lower, start)
+                if pos < 0:
+                    break
+                matches.append((pos, pos + len(query)))
+                start = pos + max(len(query), 1)
+
+            search_state["matches"] = matches
+            if not matches:
+                search_state["index"] = -1
+                editor.setExtraSelections([])
+                search_status.setText("0/0")
+                return
+
+            if keep_index and 0 <= search_state["index"] < len(matches):
+                idx = search_state["index"]
+            else:
+                cursor_pos = editor.textCursor().position()
+                idx = 0
+                for i, (begin, end) in enumerate(matches):
+                    if begin <= cursor_pos <= end or begin >= cursor_pos:
+                        idx = i
+                        break
+            search_state["index"] = idx
+
+            normal_fmt = QTextCharFormat()
+            normal_fmt.setBackground(QColor("#fbbf24"))
+            normal_fmt.setForeground(QColor("#111111"))
+            current_fmt = QTextCharFormat()
+            current_fmt.setBackground(QColor("#22c55e"))
+            current_fmt.setForeground(QColor("#111111"))
+            selections = []
+            doc = editor.document()
+            for i, (begin, end) in enumerate(matches):
+                cur = QTextCursor(doc)
+                cur.setPosition(begin)
+                cur.setPosition(end, QTextCursor.KeepAnchor)
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = cur
+                sel.format = current_fmt if i == idx else normal_fmt
+                selections.append(sel)
+            editor.setExtraSelections(selections)
+            search_status.setText(f"{idx + 1}/{len(matches)}")
+
+        def jump_search(delta=1):
+            if not search_ent.text():
+                return
+            if not search_state["matches"]:
+                update_search_highlight()
+                if not search_state["matches"]:
+                    return
+            idx = (search_state["index"] + delta) % len(search_state["matches"])
+            search_state["index"] = idx
+            begin, end = search_state["matches"][idx]
+            cur = editor.textCursor()
+            cur.setPosition(begin)
+            cur.setPosition(end, QTextCursor.KeepAnchor)
+            editor.setTextCursor(cur)
+            editor.ensureCursorVisible()
+            update_search_highlight(keep_index=True)
+
+        def load_file(rel):
+            try:
+                full = safe_abs(rel)
+                with open(full, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(full, "r", encoding="utf-8-sig", errors="replace") as f:
+                        text = f.read()
+                except Exception as e:
+                    QMessageBox.warning(dlg, "读取失败", str(e))
+                    return
+            except Exception as e:
+                QMessageBox.warning(dlg, "读取失败", str(e))
+                return
+
+            editor.blockSignals(True)
+            editor.setPlainText(text)
+            editor.blockSignals(False)
+            editor.setEnabled(True)
+            btn_beautify.setEnabled(True)
+            btn_save.setEnabled(True)
+            current.update({"path": full, "rel": rel, "dirty": False})
+            file_lbl.setText(rel)
+            update_search_highlight()
+
+        def maybe_save_before_switch():
+            if not current["dirty"]:
+                return True
+            r = QMessageBox.question(
+                dlg,
+                "保存修改",
+                f"{current['rel']} 有未保存修改，是否保存？",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if r == QMessageBox.Cancel:
+                return False
+            if r == QMessageBox.Yes:
+                return save_current()
+            return True
+
+        def on_select():
+            item = tree.currentItem()
+            if not item:
+                return
+            rel = item.data(0, Qt.UserRole)
+            if rel == current["rel"]:
+                return
+            if not maybe_save_before_switch():
+                tree.blockSignals(True)
+                matches = tree.findItems(current["rel"], Qt.MatchExactly)
+                if matches:
+                    tree.setCurrentItem(matches[0])
+                tree.blockSignals(False)
+                return
+            load_file(rel)
+
+        def save_current():
+            if not current["path"]:
+                return False
+            try:
+                with open(current["path"], "w", encoding="utf-8", newline="") as f:
+                    f.write(editor.toPlainText())
+            except Exception as e:
+                QMessageBox.warning(dlg, "保存失败", str(e))
+                return False
+            current["dirty"] = False
+            file_lbl.setText(current["rel"])
+            self._ext_update_app_buttons(appid)
+            log_func(f"已保存代码: {appid}/{current['rel']}")
+            return True
+
+        def reload_current():
+            if current["rel"] and maybe_save_before_switch():
+                load_file(current["rel"])
+
+        def beautify_current():
+            if not current["path"]:
+                return
+            ext = os.path.splitext(current["rel"])[1].lower()
+            text = editor.toPlainText()
+            try:
+                formatted = beautify_text(text, ext)
+            except Exception as e:
+                QMessageBox.warning(dlg, "美化失败", str(e))
+                return
+            if formatted == text:
+                log_func(f"无需美化: {appid}/{current['rel']}")
+                return
+            editor.setPlainText(formatted)
+            current["dirty"] = True
+            if not file_lbl.text().endswith(" *"):
+                file_lbl.setText(file_lbl.text() + " *")
+            update_search_highlight()
+            log_func(f"已美化代码: {appid}/{current['rel']}")
+
+        def close_dialog():
+            if maybe_save_before_switch():
+                dlg.accept()
+
+        tree.currentItemChanged.connect(lambda *_: on_select())
+        editor.textChanged.connect(mark_dirty)
+        editor.textChanged.connect(lambda: update_search_highlight(keep_index=True))
+        file_filter.textChanged.connect(refill_tree)
+        search_ent.textChanged.connect(lambda: update_search_highlight())
+        search_ent.returnPressed.connect(lambda: jump_search(1))
+        search_prev.clicked.connect(lambda: jump_search(-1))
+        search_next.clicked.connect(lambda: jump_search(1))
+        btn_open_dir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(decompile_dir)))
+        btn_reload.clicked.connect(reload_current)
+        btn_beautify.clicked.connect(beautify_current)
+        btn_save.clicked.connect(save_current)
+        btn_close.clicked.connect(close_dialog)
+        dlg.finished.connect(lambda _code: None)
+
+        list_files()
+        if tree.topLevelItemCount() > 0:
+            tree.setCurrentItem(tree.topLevelItem(0))
+            on_select()
+        dlg.exec()
+
+    # ============================================
     # 提取页 - 子进程通信
     # ============================================
 
@@ -2439,6 +3186,7 @@ class App(QMainWindow):
             self._ext_app_states[appid]["decompiled"] = False
             self._ext_app_states[appid]["scanned"] = False
         self._ext_update_app_buttons(appid)
+        self._mod_refresh_apps()
         # 如果开启了自动反编译，重新处理
         QTimer.singleShot(500, self._ext_auto_process_pending)
 
@@ -2463,6 +3211,7 @@ class App(QMainWindow):
             self._ext_app_states[appid]["decompiled"] = False
             self._ext_app_states[appid]["scanned"] = False
             self._ext_update_app_buttons(appid)
+        self._mod_refresh_apps()
 
     def _ext_clear_applet(self):
         """清空 Applet 目录"""
@@ -2481,6 +3230,7 @@ class App(QMainWindow):
             self._ext_app_states.clear()
             self._ext_last_appids = set()
             self._ext_refresh_apps()
+            self._mod_refresh_apps()
         except Exception as e:
             self._ext_log(f"清空失败: {e}")
 
@@ -4009,6 +4759,130 @@ class App(QMainWindow):
             else:
                 self._vc_status_lbl.setText("状态: 未开启")
                 self._vc_status_lbl.setStyleSheet(f"color: {c['text3']};")
+        elif kind == "__runtime_patch__":
+            fut = item[1]
+            log_func = item[2] if len(item) > 2 else self._ext_log
+            status_label = item[3] if len(item) > 3 else self._ext_status_lbl
+            c = _TH[self._tn]
+            self._runtime_patch_busy = False
+            try:
+                result = fut.result()
+                before = result.get("text_before", {}) if isinstance(result, dict) else {}
+                after = result.get("text_after", {}) if isinstance(result, dict) else {}
+                api_before = result.get("api_before", {}) if isinstance(result, dict) else {}
+                api_after = result.get("api_after", {}) if isinstance(result, dict) else {}
+                method_before = result.get("method_before", {}) if isinstance(result, dict) else {}
+                method_after = result.get("method_after", {}) if isinstance(result, dict) else {}
+                behavior_before = result.get("behavior_before", {}) if isinstance(result, dict) else {}
+                behavior_after = result.get("behavior_after", {}) if isinstance(result, dict) else {}
+                refresh = result.get("refresh", "") if isinstance(result, dict) else ""
+                before_changed = int(before.get("changed") or 0)
+                after_changed = int(after.get("changed") or 0)
+                api_contexts = max(int(api_before.get("contexts") or 0), int(api_after.get("contexts") or 0))
+                method_changed = self._runtime_page_hook_changed(method_before) + self._runtime_page_hook_changed(method_after)
+                behavior_hooked = self._runtime_behavior_hooked(behavior_before) + self._runtime_behavior_hooked(behavior_after)
+                changed = before_changed + after_changed
+                contexts = max(int(before.get("contexts") or 0), int(after.get("contexts") or 0))
+                hit = runtime_patch_hit_summary(before) or runtime_patch_hit_summary(after)
+                msg = (
+                    f"运行时修改完成: 文本={changed}, JS方法={method_changed}, "
+                    f"API={api_contexts}, 行为Hook={behavior_hooked}, contexts={contexts}"
+                )
+                if hit:
+                    msg += f", hit={hit}"
+                if refresh:
+                    msg += f", refresh={refresh}"
+                log_func(msg)
+                if changed == 0 and method_changed == 0 and behavior_hooked == 0:
+                    self._log_runtime_patch_details(log_func, result)
+                status_label.setText("运行时修改已应用")
+                status_label.setStyleSheet(f"color: {c['success']};")
+            except Exception as e:
+                log_func(f"运行时修改失败: {e}")
+                status_label.setText("运行时修改失败")
+                status_label.setStyleSheet(f"color: {c['error']};")
+
+    def _log_runtime_patch_details(self, log_func, result):
+        if not isinstance(result, dict):
+            return
+        stages = [
+            ("text_before", "文本-刷新前"),
+            ("api_before", "API-刷新前"),
+            ("method_before", "方法-刷新前"),
+            ("behavior_before", "行为-刷新前"),
+            ("text_after", "文本-刷新后"),
+            ("api_after", "API-刷新后"),
+            ("method_after", "方法-刷新后"),
+            ("behavior_after", "行为-刷新后"),
+        ]
+        for key, label in stages:
+            data = result.get(key)
+            if not isinstance(data, dict):
+                continue
+            contexts = data.get("contexts", 0)
+            changed = data.get("changed", 0)
+            log_func(f"  [{label}] contexts={contexts}, changed={changed}")
+            for idx, item in enumerate(data.get("results", [])[:8], 1):
+                if not isinstance(item, dict):
+                    log_func(f"    #{idx}: {str(item)[:180]}")
+                    continue
+                ctx = item.get("context", {})
+                ctx_id = ctx.get("id", "-") if isinstance(ctx, dict) else "-"
+                aux = ctx.get("auxData", {}) if isinstance(ctx, dict) else {}
+                frame = aux.get("frameId", "") if isinstance(aux, dict) else ""
+                value = item.get("value")
+                err = item.get("error", "")
+                summary = self._runtime_value_summary(value)
+                if err:
+                    summary += f", error={err}"
+                log_func(f"    #{idx}: ctx={ctx_id}, frame={frame[:8]}, {summary}")
+
+    def _runtime_value_summary(self, value):
+        if not isinstance(value, dict):
+            return f"value={str(value)[:160]}"
+        parts = []
+        if "wxml" in value or "page" in value or "domChanged" in value:
+            wxml = value.get("wxml") or {}
+            page = value.get("page") or {}
+            parts.append(f"wxml={wxml.get('changed', 0)}")
+            parts.append(f"page={page.get('changed', 0)}/{page.get('pages', 0)}")
+            parts.append(f"dom={value.get('domChanged', 0)}")
+            if wxml.get("errors"):
+                parts.append(f"wxml_errors={str(wxml.get('errors'))[:80]}")
+            if page.get("errors"):
+                parts.append(f"page_errors={str(page.get('errors'))[:80]}")
+        if "stats" in value:
+            stats = value.get("stats") or []
+            hooked = sum(int(s.get("hooked") or 0) for s in stats if isinstance(s, dict))
+            changed = sum(int(s.get("changed") or 0) for s in stats if isinstance(s, dict))
+            errors = [e for s in stats if isinstance(s, dict) for e in (s.get("errors") or [])]
+            parts.append(f"api_hooked={hooked}")
+            parts.append(f"api_changed={changed}")
+            if errors:
+                parts.append(f"api_errors={str(errors[:3])[:120]}")
+        if "pageHook" in value:
+            hook = value.get("pageHook") or {}
+            targets = hook.get("targets") or []
+            errors = hook.get("errors") or []
+            parts.append(f"methods={hook.get('methods', 0)}")
+            parts.append(f"compiled={hook.get('compiled', 0)}")
+            parts.append(f"pages={hook.get('pages', 0)}")
+            parts.append(f"method_changed={hook.get('changed', 0)}")
+            parts.append(f"constructors={hook.get('pageConstructors', 0)}")
+            parts.append(f"scanned={hook.get('scanned', 0)}")
+            if targets:
+                parts.append(f"targets={targets[:5]}")
+            if errors:
+                parts.append(f"errors={errors[:5]}")
+        if "behaviorHook" in value:
+            hook = value.get("behaviorHook") or {}
+            parts.append(f"behavior_hooked={hook.get('hooked', 0)}")
+            parts.append(f"behavior_calls={hook.get('calls', 0)}")
+            if hook.get("errors"):
+                parts.append(f"behavior_errors={hook.get('errors')[:5]}")
+        if not parts:
+            return f"value={str(value)[:160]}"
+        return ", ".join(str(p) for p in parts)
 
     def _handle_cld(self, item):
         kind = item[0]
@@ -4087,6 +4961,32 @@ class App(QMainWindow):
                 self._cloud_result.setHtml(
                     f'<span style="color:{c["warning"]}">{name} -> {detail}</span>')
 
+    def _runtime_page_hook_changed(self, data):
+        total = 0
+        if not isinstance(data, dict):
+            return total
+        for item in data.get("results", []):
+            value = item.get("value") if isinstance(item, dict) else None
+            if not isinstance(value, dict):
+                continue
+            hook = value.get("pageHook") or {}
+            if isinstance(hook, dict):
+                total += int(hook.get("changed") or 0)
+        return total
+
+    def _runtime_behavior_hooked(self, data):
+        total = 0
+        if not isinstance(data, dict):
+            return total
+        for item in data.get("results", []):
+            value = item.get("value") if isinstance(item, dict) else None
+            if not isinstance(value, dict):
+                continue
+            hook = value.get("behaviorHook") or {}
+            if isinstance(hook, dict):
+                total += int(hook.get("hooked") or 0)
+        return total
+
     def _handle_ext(self, item):
         kind = item.get("type", "")
         c = _TH[self._tn]
@@ -4117,6 +5017,7 @@ class App(QMainWindow):
                     self._ext_status_lbl.setText(f"反编译完成! {appid} 提取了 {extracted} 个文件")
                     self._ext_status_lbl.setStyleSheet(f"color: {c['success']};")
                     self._ext_update_app_buttons(appid)
+                    self._mod_refresh_apps()
                     # 刷新名称显示（解包后可读取 app-config.json）
                     widgets = self._ext_app_widgets.get(appid, {})
                     if "lbl_name" in widgets:

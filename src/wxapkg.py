@@ -1,6 +1,6 @@
 """
 wxapkg.py — 微信小程序 wxapkg 解密 + 解包 (WeChat 4.0+)
-纯 Python 实现，基于 KillWxapkg 算法
+纯 Python 实现，用于解密、解包和生成运行时修改所需的文件映射
 
 加密格式:
     - Magic: "V1MMWX" (6 bytes)
@@ -20,21 +20,19 @@ wxapkg.py — 微信小程序 wxapkg 解密 + 解包 (WeChat 4.0+)
     - body data
 """
 import hashlib
+import json
 import os
 import struct
-from pathlib import Path
+import time
 from typing import List, Optional, Tuple
 
 try:
     from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
 except ImportError:
     try:
         from Cryptodome.Cipher import AES
-        from Cryptodome.Util.Padding import unpad
     except ImportError:
         AES = None
-        unpad = None
 
 MAGIC = b"V1MMWX"
 SALT = b"saltiest"
@@ -53,15 +51,15 @@ def decrypt_wxapkg(data: bytes, app_id: str) -> bytes:
     if AES is None:
         raise ImportError("需要安装 pycryptodome: pip install pycryptodome")
 
-    if len(data) < 1030:
-        raise ValueError("文件太小，不是有效的加密 wxapkg")
-
     # 检查 magic header
     if data[:6] != MAGIC:
         # 可能是未加密的 wxapkg，直接返回
         if data[0:1] == b'\xbe':
             return data
         raise ValueError(f"未知文件格式 (magic: {data[:6].hex()})")
+
+    if len(data) < 1030:
+        raise ValueError("文件太小，不是有效的加密 wxapkg")
 
     key = _derive_key(app_id)
 
@@ -77,6 +75,10 @@ def decrypt_wxapkg(data: bytes, app_id: str) -> bytes:
     xor_decrypted = bytes(b ^ xor_key for b in tail)
 
     return decrypted_header + xor_decrypted
+
+
+def is_encrypted_wxapkg(data: bytes) -> bool:
+    return data[:6] == MAGIC
 
 
 def unpack_wxapkg(data: bytes) -> List[Tuple[str, bytes]]:
@@ -153,19 +155,45 @@ def unpack_wxapkg(data: bytes) -> List[Tuple[str, bytes]]:
     return result
 
 
-def extract_wxapkg(wxapkg_path: str, output_dir: str, app_id: str) -> List[str]:
+def _normalize_pkg_path(name: str) -> str:
+    """Normalize a package path and reject paths that can escape the package."""
+    name = name.replace("\\", "/").lstrip("/")
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise ValueError(f"非法包内路径: {name}")
+    if not parts:
+        raise ValueError("包内路径不能为空")
+    return "/".join(parts)
+
+
+def _normalize_index_path(name: str) -> str:
+    """Normalize a package index path while preserving a leading slash."""
+    raw = name.replace("\\", "/")
+    leading = raw.startswith("/")
+    normalized = _normalize_pkg_path(raw)
+    return "/" + normalized if leading else normalized
+
+
+def extract_wxapkg(wxapkg_path: str, output_dir: str, app_id: str,
+                   package_info: Optional[dict] = None) -> List[str]:
     """解密并解包 wxapkg 到指定目录，返回提取的文件路径列表"""
     with open(wxapkg_path, "rb") as f:
         raw = f.read()
 
+    encrypted = is_encrypted_wxapkg(raw)
     decrypted = decrypt_wxapkg(raw, app_id)
     files = unpack_wxapkg(decrypted)
+    if package_info is not None:
+        package_info["encrypted"] = encrypted
+        package_info["format"] = "V1MMWX" if encrypted else "raw"
 
     extracted = []
-    for name, content in files:
+    for raw_name, content in files:
         # 规范化路径，防止路径穿越
-        name = name.lstrip("/").replace("\\", "/")
-        if ".." in name:
+        try:
+            package_path = _normalize_index_path(raw_name)
+            name = _normalize_pkg_path(raw_name)
+        except ValueError:
             continue
 
         out_path = os.path.join(output_dir, name)
@@ -174,8 +202,29 @@ def extract_wxapkg(wxapkg_path: str, output_dir: str, app_id: str) -> List[str]:
         with open(out_path, "wb") as f:
             f.write(content)
         extracted.append(out_path)
+        if package_info is not None:
+            package_info.setdefault("files", []).append({
+                "path": name,
+                "package_path": package_path,
+                "size": len(content),
+                "mtime": os.path.getmtime(out_path),
+            })
 
     return extracted
+
+
+def write_manifest(app_id: str, packages: List[dict], output_dir: str) -> str:
+    """Write a decompile manifest used by later pack/replace steps."""
+    manifest = {
+        "version": 1,
+        "appid": app_id,
+        "packages": packages,
+        "created_at": int(time.time()),
+    }
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    return manifest_path
 
 
 def find_wxapkg_files(packages_dir: str) -> List[dict]:
